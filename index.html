@@ -350,12 +350,57 @@ code.k { font: 12px ui-monospace, Menlo, monospace; word-break: break-all; }
   body[data-view="multi"] .mexit { display: inline-flex !important; }
 }
 .mexit { display: none !important; position: fixed; z-index: 61; top: max(8px, env(safe-area-inset-top)); right: max(8px, env(safe-area-inset-right)); background: rgba(0,0,0,.45) !important; color: #fff !important; border-color: rgba(255,255,255,.25) !important; }
+
+/* ---------- smooth screen changes ----------
+   View Transitions (Chrome/Edge 111+, Safari 18+): sidebar + tab bar stay put, the page slides/fades.
+   Older browsers get the same entrance as a plain CSS animation on #main (.enter). */
+.side > .glass { view-transition-name: side; }
+.tabbar { view-transition-name: tabbar; }
+main { view-transition-name: main; }
+::view-transition-group(side), ::view-transition-group(tabbar) { animation-duration: .3s; }
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: .3s; }
+::view-transition-group(main) { animation-duration: .38s; animation-timing-function: cubic-bezier(.2,.8,.2,1); }
+::view-transition-old(main) { animation: vt-out .2s cubic-bezier(.4,0,1,1) both; }
+::view-transition-new(main) { animation: vt-in .38s cubic-bezier(.2,.8,.2,1) both; }
+:root[data-nav="fwd"]::view-transition-old(main) { animation-name: vt-out-l; }
+:root[data-nav="fwd"]::view-transition-new(main) { animation-name: vt-in-r; }
+:root[data-nav="back"]::view-transition-old(main) { animation-name: vt-out-r; }
+:root[data-nav="back"]::view-transition-new(main) { animation-name: vt-in-l; }
+@keyframes vt-out { to { opacity: 0; transform: scale(.985); } }
+@keyframes vt-in { from { opacity: 0; transform: scale(1.012); } }
+@keyframes vt-out-l { to { opacity: 0; transform: translateX(-4%) scale(.985); } }
+@keyframes vt-out-r { to { opacity: 0; transform: translateX(4%) scale(.985); } }
+@keyframes vt-in-r { from { opacity: 0; transform: translateX(5%); } }
+@keyframes vt-in-l { from { opacity: 0; transform: translateX(-5%); } }
+main.enter { animation: vt-in .36s cubic-bezier(.2,.8,.2,1) both; }
+main.enter[data-nav="fwd"] { animation-name: vt-in-r; }
+main.enter[data-nav="back"] { animation-name: vt-in-l; }
+.login .card { animation: vt-in .45s cubic-bezier(.2,.8,.2,1) both; }
+.viewer { animation: fade-in .22s ease-out both; }
+.viewer .media > * { animation: vt-in .3s cubic-bezier(.2,.8,.2,1) both; }
+.viewer.out { animation: fade-out .2s ease-in both; pointer-events: none; }
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes fade-out { to { opacity: 0; } }
+.toast:not([hidden]) { animation: toast-in .28s cubic-bezier(.2,.8,.2,1) both; }
+@keyframes toast-in { from { opacity: 0; transform: translate(-50%, 10px); } }
+/* reconnecting: keep the last picture, dimmed, instead of a black flash */
+.stage video, .tile video { transition: filter .35s ease, opacity .35s ease; }
+.stage.wait video, .tile.wait video { filter: brightness(.5) saturate(.6); }
+.tile.wait::before { content: ""; position: absolute; z-index: 2; left: 50%; top: 50%; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+  border-radius: 50%; border: 3px solid #fff3; border-top-color: #fff; animation: spin 1s linear infinite; pointer-events: none; }
+/* while video plays, stop the drifting blurred backdrop: it costs GPU time the decoders need */
+body[data-view="live"]::before, body[data-view="live"]::after,
+body[data-view="multi"]::before, body[data-view="multi"]::after { animation-play-state: paused; }
+@media (prefers-reduced-motion: reduce) {
+  main.enter, .login .card, .viewer, .viewer .media > *, .toast:not([hidden]) { animation: none; }
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
+}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.8.0/dist/mpegts.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js" defer></script>
 </head>
 <body>
 <div id="root"></div>
-<script type="module" src="app.js?v=5"></script>
+<script type="module" src="app.js?v=6"></script>
 </body>
 </html>

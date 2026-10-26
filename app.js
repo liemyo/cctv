@@ -107,14 +107,41 @@ function go(view, sn) {
   if (location.hash !== hash) location.hash = hash; else route();
 }
 
+// screen order for the slide direction: further right = slides in from the right
+const DEPTH = { cams: 0, live: 0.5, multi: 1, pesan: 2, klip: 3, saya: 4 };
+
 function route() {
   const [view, sn] = location.hash.slice(1).split('/');
-  stopAllPlayers();
-  clearInterval(S.tick);
-  if (!S.session) { renderLogin(); return; }
-  S.view = VIEWS.some(v => v[0] === view) || view === 'live' ? view : 'cams';
-  S.liveSn = sn || null;
-  renderShell();
+  const next = !S.session ? 'login' : VIEWS.some(v => v[0] === view) || view === 'live' ? view : 'cams';
+  const dir = next === S.view ? 'same' : (DEPTH[next] ?? -1) > (DEPTH[S.view] ?? -1) ? 'fwd' : 'back';
+  smooth(() => {
+    stopAllPlayers();
+    clearInterval(S.tick);
+    if (!S.session) { S.view = 'login'; renderLogin(); return; }
+    S.view = next;
+    S.liveSn = sn || null;
+    renderShell();
+  }, dir);
+}
+
+/** Swaps the screen with a short slide + fade: View Transitions where the browser has them
+ *  (the old picture, live video included, glides out while the new one comes in), else a CSS entrance. */
+function smooth(update, dir) {
+  const calm = matchMedia('(prefers-reduced-motion: reduce)').matches || !S.view || document.hidden;
+  const root = document.documentElement;
+  if (!calm && document.startViewTransition) {
+    root.dataset.nav = dir;
+    const t = document.startViewTransition(update);
+    t.ready.catch(() => {});
+    t.finished.finally(() => { if (root.dataset.nav === dir) delete root.dataset.nav; });
+    return;
+  }
+  update();
+  const m = $('#main') || $('#root');
+  if (calm || !m) return;
+  m.dataset.nav = dir;
+  m.classList.add('enter');
+  m.addEventListener('animationend', () => m.classList.remove('enter'), { once: true });
 }
 window.addEventListener('hashchange', route);
 
@@ -347,10 +374,13 @@ function liveMode() {
 }
 
 /** Live view for one camera. FLV (native H.265, ~1–2 s behind) when the browser plays it well, else relay HLS (H.264, 3–8 s). */
+/** Rejects when a request hangs (dead connection after sleep / network switch) instead of waiting forever. */
+const within = (p, ms, why) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error(why)), ms))]);
+
 class LivePlayer {
   constructor(video, dev, { stream = '1', muted = true, onState = () => {} } = {}) {
     this.video = video; this.dev = dev; this.stream = stream; this.muted = muted; this.onState = onState;
-    this.fails = 0; this.mode = liveMode();
+    this.fails = 0; this.mode = liveMode(); this.alive = Date.now();
     video.muted = muted; video.playsInline = true; video.crossOrigin = 'anonymous';
     this.onReady = () => this.kick();
     video.addEventListener('loadeddata', this.onReady);
@@ -382,18 +412,57 @@ class LivePlayer {
     const end = v.buffered.end(v.buffered.length - 1);
     const max = this.mode === 'flv' ? 1.5 : 5, keep = this.mode === 'flv' ? 0.3 : 1.5;
     if (end - v.currentTime > max) v.currentTime = end - keep;
+    else if (this.hls?.latency > 9 && this.hls.liveSyncPosition) v.currentTime = this.hls.liveSyncPosition;
+  }
+
+  /** Playback sits still although newer video is buffered (gap in the buffer, decoder hiccup): step over it. */
+  nudge() {
+    const v = this.video;
+    if (v.seeking || !v.buffered.length) return;
+    const end = v.buffered.end(v.buffered.length - 1);
+    if (end - v.currentTime > 0.25) v.currentTime = Math.max(v.currentTime, end - (this.mode === 'flv' ? 0.3 : 1));
+    if (v.paused && v.readyState >= 2) this.kick();
+  }
+
+  /** Tiny fingerprint of the picture. A live feed never repeats exactly (sensor noise, OSD clock);
+   *  the same fingerprint for a long time means the image is frozen even if frames are still counted. */
+  picPrint() {
+    const v = this.video;
+    if (this.noPrint || !v.videoWidth) return null;
+    try {
+      const c = this.pc ||= Object.assign(document.createElement('canvas'), { width: 128, height: 72 });
+      const x = this.px ||= c.getContext('2d', { willReadFrequently: true });
+      x.imageSmoothingQuality = 'high';
+      x.drawImage(v, 0, 0, 128, 72);
+      const d = x.getImageData(0, 0, 128, 72).data;
+      let h = 0;
+      for (let i = 0; i < d.length; i += 4) h = (h * 31 + d[i] + d[i + 1] * 3 + d[i + 2] * 7) | 0;
+      return h;
+    } catch { this.noPrint = true; return null; } // tainted (cross-origin native HLS): rely on frame counts
+  }
+
+  /** Keep the last picture on screen (dimmed by the caller) while reconnecting instead of going black. */
+  keepFrame() {
+    const v = this.video;
+    if (v.readyState < 2 || !v.videoWidth) return;
+    try {
+      const c = document.createElement('canvas'), w = Math.min(640, v.videoWidth);
+      c.width = w; c.height = Math.round(w * v.videoHeight / v.videoWidth);
+      c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+      v.poster = c.toDataURL('image/jpeg', 0.7);
+    } catch {}
   }
 
   async start() {
     this.teardown();
-    this.stopped = false;
+    this.stopped = false; this.alive = Date.now();
     const gen = this.gen = (this.gen || 0) + 1;
     this.onState('connect', this.mode === 'flv' ? 'Menyambung (cepat)…' : 'Menyambung…');
     try {
-      if (S.status[this.dev.sn] === 'sleeping') { try { await api.wakeUp(this.dev); } catch {} }
-      const url = await api.liveURL(this.dev, this.mode === 'flv'
+      if (S.status[this.dev.sn] === 'sleeping') { try { await within(api.wakeUp(this.dev), 8000, 'bangun'); } catch {} }
+      const url = await within(api.liveURL(this.dev, this.mode === 'flv'
         ? { stream: this.stream, protocol: 'flv' }
-        : { stream: this.stream, protocol: 'hls-ts', videoCode: 'h264' });
+        : { stream: this.stream, protocol: 'hls-ts', videoCode: 'h264' }), 15000, 'Server kamera tidak menjawab');
       if (gen !== this.gen || this.stopped) return;
       this.mode === 'flv' ? this.playFLV(url) : this.playHLS(url);
       this.watch(gen);
@@ -427,32 +496,42 @@ class LivePlayer {
     }
   }
 
-  /** Watchdog: no picture within 14 s, or no new frame for 6 s (FLV) / 10 s (HLS) → reconnect.
-   *  A frozen FLV picture in auto mode switches to HLS at once (and for the rest of the visit). */
+  /** Watchdog: no picture within 14 s, or no new frame for 5 s (FLV) / 9 s (HLS) → reconnect; after 2 s
+   *  still it first tries to step to newer buffered video. The same picture for 20 s while frames are
+   *  still counted (frozen image) also reconnects. A frozen FLV picture in auto mode switches to HLS at once. */
   watch(gen) {
-    let lastF = -1, lastT = -1, still = 0, started = false;
+    let lastF = -1, lastT = -1, still = 0, started = false, print = null, same = 0, n = 0;
     clearInterval(this.timer);
     this.timer = setInterval(() => {
       if (gen !== this.gen) return;
       const v = this.video;
-      if (document.hidden) { still = 0; return; }
+      if (document.hidden) { still = 0; same = 0; return; }
       if (v.paused && v.readyState >= 2) this.kick();
       this.toEdge();
       const f = this.frameCount(), t = v.currentTime;
       const moving = !v.paused && (f != null ? f > 0 && f !== lastF : t > 0 && t !== lastT);
       lastF = f; lastT = t;
+      if (moving && started && ++n % 2 === 0) {
+        const h = this.picPrint();
+        same = h != null && h === print ? same + 2 : 0;
+        print = h;
+        if (same >= 20) { this.fails++; return this.retry('Gambar membeku — menyambung ulang…'); }
+      }
       if (moving) {
-        still = 0;
+        still = 0; this.alive = Date.now();
         if (!started) { started = true; this.fails = 0; this.onState('play'); this.watcher?.restart(); }
         // latency readout (seconds of buffered video not yet shown)
         const b = v.buffered.length ? v.buffered.end(v.buffered.length - 1) - t : 0;
         this.lag = b;
         this.onState('tick', b);
       } else if (this.blocked) {
+        this.alive = Date.now();
         this.onState('blocked');
       } else {
         still += 1;
-        if (still < (!started ? 14 : this.mode === 'flv' ? 6 : 10)) return;
+        if (started && (still === 2 || still === 4)) this.nudge();
+        if (started && still === 2) this.onState('stall');
+        if (still < (!started ? 14 : this.mode === 'flv' ? 5 : 9)) return;
         if (started && this.mode === 'flv' && store.get('mode', 'auto') === 'auto') {
           S.flvFrozen = true; this.fails = 2;
           this.retry('Gambar macet');
@@ -469,6 +548,7 @@ class LivePlayer {
     this.watcher?.pause();
     if (this.mode === 'flv' && this.fails >= 2 && store.get('mode', 'auto') !== 'flv') { this.mode = 'hls'; this.fails = 0; why += ' — beralih ke mode stabil'; }
     this.onState('retry', why);
+    this.keepFrame();
     this.teardown();
     clearTimeout(this.rt);
     this.rt = setTimeout(() => this.start(), Math.min(2000 + this.fails * 1500, 8000));
@@ -486,6 +566,7 @@ class LivePlayer {
 
   stop() {
     this.stopped = true; this.gen++; this.watcher?.stop(); this.teardown(); players.delete(this);
+    this.video.removeAttribute('poster');
     this.video.removeEventListener('loadeddata', this.onReady);
     this.video.removeEventListener('canplay', this.onReady);
     if (this.blocked) { this.blocked = false; autoplayHint(); }
@@ -513,8 +594,19 @@ let hiddenAt = 0;
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) { hiddenAt = Date.now(); return; }
   const away = hiddenAt && Date.now() - hiddenAt > 8000;
-  players.forEach(p => { if (away) p.start(); else { p.toEdge(); p.kick(); } });
+  players.forEach(p => { p.alive = Date.now(); if (away) p.start(); else { p.toEdge(); p.kick(); } });
 });
+// Supervisor above every player's own watchdog: whatever got stuck (a hung request, a timer that never
+// fired, a stream that neither plays nor errors), 25 s on screen without a moving picture → start over.
+setInterval(() => {
+  if (document.hidden) return;
+  const now = Date.now();
+  players.forEach(p => {
+    if (p.stopped || p.blocked || now - p.alive < 25000) return;
+    p.alive = now; p.fails++;
+    p.retry('Siaran macet — memuat ulang…');
+  });
+}, 5000);
 window.addEventListener('pageshow', e => { if (e.persisted) players.forEach(p => p.start()); });
 window.addEventListener('online', () => players.forEach(p => p.start()));
 
@@ -732,6 +824,7 @@ function viewLive() {
     player = new LivePlayer(video, d, {
       stream, muted: player ? player.muted : true,
       onState: (s, x) => {
+        stage.classList.toggle('wait', s === 'connect' || s === 'retry');
         if (s === 'connect') { setMsg(x); $('#lb').innerHTML = '<i class="dot sleeping"></i><span>Menyambung</span>'; }
         if (s === 'retry') { setMsg(x); $('#lb').innerHTML = '<i class="dot offline"></i><span>Terputus</span>'; }
         if (s === 'play') { setMsg(null); label(); }
@@ -949,7 +1042,10 @@ function viewMulti() {
     const d = devBySn(t.dataset.sn), dot = t.querySelector('.dot');
     const p = new LivePlayer(t.querySelector('video'), d, {
       stream: n === 1 ? '0' : '1',
-      onState: s => { dot.className = 'dot ' + (s === 'play' || s === 'tick' ? 'online' : s === 'retry' ? 'offline' : 'sleeping'); },
+      onState: s => {
+        dot.className = 'dot ' + (s === 'play' || s === 'tick' ? 'online' : s === 'retry' ? 'offline' : 'sleeping');
+        t.classList.toggle('wait', s === 'connect' || s === 'retry');
+      },
     });
     attachWatch(p, t.querySelector('.ov'), { onMotion: m => t.classList.toggle('motion', m) });
     p.start();
@@ -984,7 +1080,11 @@ function openViewer(items, index) {
       : `<img src="${esc(src)}" alt="">`;
   };
   const act = a => {
-    if (a === 'x') { el.remove(); document.removeEventListener('keydown', key); }
+    if (a === 'x') {
+      document.removeEventListener('keydown', key);
+      el.classList.add('out');
+      setTimeout(() => el.remove(), 220);
+    }
     if (a === 'prev' && i > 0) { i--; draw(); }
     if (a === 'next' && i < items.length - 1) { i++; draw(); }
     if (a === 'dl' && items[i].src) saveURL(items[i].src, items[i].file || 'pantau');
