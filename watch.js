@@ -18,8 +18,11 @@ export class Watcher {
     this.video = video; this.canvas = canvas; this.opt = opt;
     this.work = document.createElement('canvas');
     this.ctx = this.work.getContext('2d', { willReadFrequently: true });
-    this.boxes = []; this.recent = []; this.active = false;
+    this.boxes = []; this.recent = []; this.active = false; this.people = []; this.peopleAt = 0;
   }
+
+  /** Person boxes from the person detector (person.js), drawn with a label next to the motion boxes. */
+  setPeople(people) { this.people = people; this.peopleAt = performance.now(); this.draw(); }
 
   get level() { return LEVELS[this.opt.level] || LEVELS.agresif; }
 
@@ -32,7 +35,7 @@ export class Watcher {
   stop() {
     clearInterval(this.timer); this.timer = null;
     if (this.active) { this.active = false; this.opt.onEnd?.(); }
-    this.boxes = []; this.draw();
+    this.boxes = []; this.people = []; this.draw();
   }
 
   /** Forget the background (new stream, PTZ move, light switch): the next frames become the reference. */
@@ -125,11 +128,14 @@ export class Watcher {
     if (c.width !== cw || c.height !== chh) { c.width = cw; c.height = chh; }
     const g = c.getContext('2d');
     g.clearRect(0, 0, cw, chh);
-    if (!this.active || !this.boxes.length || !v.videoWidth) return; // only during an event (no stray OSD boxes)
+    const people = performance.now() - this.peopleAt < 2500 ? this.people : [];
+    // motion boxes only during an event (no stray OSD boxes)
+    if (!v.videoWidth || (!people.length && (!this.active || !this.boxes.length))) return;
     const fit = getComputedStyle(v).objectFit === 'cover' ? Math.max : Math.min;
     const s = fit(cw / v.videoWidth, chh / v.videoHeight), dw = v.videoWidth * s, dh = v.videoHeight * s;
     const ox = (cw - dw) / 2, oy = (chh - dh) / 2;
-    paintBoxes(g, this.boxes, ox, oy, dw, dh, dpr, this.active);
+    if (this.active && !people.length) paintBoxes(g, this.boxes, ox, oy, dw, dh, dpr, this.active);
+    if (people.length) paintBoxes(g, personBoxes(people), ox, oy, dw, dh, dpr);
   }
 }
 
@@ -180,12 +186,16 @@ function blobs(act, cw, ch, live) {
   return out.sort((a, b) => b.k - a.k).slice(0, 8);
 }
 
-/** Corner-bracket boxes; used on the overlay and burned into saved photos. */
+/** Person detections as labelled boxes: moving people red, standing still yellow. */
+export const personBoxes = people => people.map(p => ({ ...p, col: p.moving ? '#ff3b30' : '#ffd60a', label: `Orang ${Math.round(p.score * 100)}%` }));
+
+/** Corner-bracket boxes (optional b.col / b.label); used on the overlay and burned into saved photos. */
 export function paintBoxes(g, boxes, ox, oy, dw, dh, scale = 1, hot = true) {
-  const col = hot ? '#ff3b30' : '#ffd60a';
-  g.lineWidth = 2.5 * scale; g.strokeStyle = col; g.fillStyle = col + '22';
+  g.lineWidth = 2.5 * scale;
   g.shadowColor = 'rgba(0,0,0,.6)'; g.shadowBlur = 4 * scale;
   for (const b of boxes) {
+    const col = b.col || (hot ? '#ff3b30' : '#ffd60a');
+    g.strokeStyle = col; g.fillStyle = col + '22';
     const pad = 4 * scale, x = ox + b.x * dw - pad, y = oy + b.y * dh - pad, w = b.w * dw + pad * 2, h = b.h * dh + pad * 2;
     const l = Math.min(w, h) * 0.28;
     g.fillRect(x, y, w, h);
@@ -194,6 +204,15 @@ export function paintBoxes(g, boxes, ox, oy, dw, dh, scale = 1, hot = true) {
       g.moveTo(px + sx * l, py); g.lineTo(px, py); g.lineTo(px, py + sy * l);
     }
     g.stroke();
+    if (b.label) {
+      g.shadowBlur = 0;
+      g.font = `600 ${Math.round(12 * scale)}px -apple-system, system-ui, sans-serif`;
+      const tw = g.measureText(b.label).width + 10 * scale, th = 18 * scale, ty = y > th ? y - th : y;
+      const lx = Math.max(0, Math.min(x, g.canvas.width - tw)); // keep the label inside the picture
+      g.fillStyle = col; g.fillRect(lx, ty, tw, th);
+      g.fillStyle = '#000'; g.fillText(b.label, lx + 5 * scale, ty + 13 * scale);
+      g.shadowBlur = 4 * scale;
+    }
   }
   g.shadowBlur = 0;
 }

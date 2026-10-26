@@ -1,6 +1,7 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
 import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=3';
-import { Watcher, PreRoll, LEVELS, snapshot } from './watch.js?v=1';
+import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=4';
+import { PersonEye, PLEVELS } from './person.js?v=2';
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -131,8 +132,14 @@ function smooth(update, dir) {
   const root = document.documentElement;
   if (!calm && document.startViewTransition) {
     root.dataset.nav = dir;
-    const t = document.startViewTransition(update);
+    // the browser runs the update only after painting the old screen; a window that paints no frames
+    // (covered, minimised pane) would leave the page empty, so render without animation after 400 ms
+    let done = false;
+    const run = () => { if (!done) { done = true; update(); } };
+    const t = document.startViewTransition(run);
+    setTimeout(() => { if (!done) { t.skipTransition(); run(); } }, 400);
     t.ready.catch(() => {});
+    t.updateCallbackDone?.catch(() => {});
     t.finished.finally(() => { if (root.dataset.nav === dir) delete root.dataset.nav; });
     return;
   }
@@ -616,9 +623,10 @@ window.addEventListener('online', () => players.forEach(p => p.start()));
 
 // ---------- motion watcher (detector + pre-roll in watch.js) ----------
 
-// level: 'off' | LEVELS key. foto/vid = save a photo / clip per motion, pre = seconds recorded before it,
-// cloud = upload to Klip Gerak (photo + mp4), dl = also download to this device.
-const WATCH0 = { level: 'agresif', last: 'agresif', foto: true, vid: true, pre: 5, cloud: true, dl: false };
+// level: 'off' | LEVELS key (pixel motion). orang: 'off' | PLEVELS key (person detector, person.js) — both
+// on by default on every camera shown. foto/vid = save a photo / clip per event, pre = seconds recorded
+// before it, cloud = upload to Klip Gerak (photo + mp4), dl = also download to this device.
+const WATCH0 = { level: 'agresif', last: 'agresif', orang: 'agresif', lastO: 'agresif', foto: true, vid: true, pre: 5, cloud: true, dl: false };
 const watchCfg = () => ({ ...WATCH0, ...store.get('watch', {}) });
 S.caps = []; // this visit's captures, newest first: {id, sn, cam, at, photo, video, secs, pre} (object URLs)
 const capHooks = new Set();
@@ -630,7 +638,7 @@ async function cloudSave(cap, kind, blob, mime, secs) {
   try {
     const path = await cs.path(cap.sn, `${cap.id}.${kind === 'video' ? 'mp4' : 'jpg'}`);
     await cs.upload(path, blob, mime);
-    const ev = { sn: cap.sn, cam: cap.cam, event: 'VideoMotion', alarm_id: cap.id, at: cap.at.toISOString(), bytes: blob.size, [kind]: path };
+    const ev = { sn: cap.sn, cam: cap.cam, event: cap.person ? 'HumanDetect' : 'VideoMotion', alarm_id: cap.id, at: cap.at.toISOString(), bytes: blob.size, [kind]: path };
     if (secs) ev.secs = secs;
     await cs.put(ev);
     cap.cloud = true;
@@ -641,57 +649,83 @@ async function cloudSave(cap, kind, blob, mime, secs) {
   }
 }
 
-/** Runs the detector on a player's video. onMotion(bool) for the red frame / badge. */
+let personWarned = false;
+
+/** Runs the motion + person detectors on a player's video. onMotion(on, person) for the red frame / badge.
+ *  An event starts on pixel motion or on a moving person and ends 6 s after both went quiet (max 60 s). */
 function attachWatch(player, overlay, { onMotion = () => {} } = {}) {
   const dev = player.dev, video = player.video;
-  let cfg = watchCfg(), ev = null, live = false;
+  let cfg = watchCfg(), ev = null, live = false, people = [], personAt = 0, endT = null;
+  const POST = 6000, MAX = 60000;
   const w = new Watcher(video, overlay, {
     level: cfg.level, post: 6, max: 60,
-    onStart: boxes => begin(boxes), onEnd: () => end(),
+    onStart: boxes => { eye.urgent(); if (!ev) begin(boxes, false); }, onEnd: () => maybeEnd(),
+  });
+  const eye = new PersonEye(video, {
+    level: cfg.orang,
+    onPeople: (list, moving) => {
+      people = list; w.setPeople(list);
+      if (!moving || !live) return;
+      personAt = performance.now();
+      if (!ev) begin(personBoxes(list), true);
+      // motion event that just began turns out to be a person: label it so (photo waits for this)
+      else if (!ev.cap.person && personAt - ev.since < 1600) { ev.cap.person = true; onMotion(true, true); }
+    },
+    onError: e => { if (!personWarned) { personWarned = true; toast(e.message); } },
   });
   const pre = new PreRoll(video, { pre: cfg.pre, bits: player.stream === '0' ? 3e6 : 1.2e6 });
-  const on = () => cfg.level !== 'off';
+  const on = () => cfg.level !== 'off', onP = () => cfg.orang !== 'off';
 
-  const begin = async boxes => {
-    const at = new Date(), cap = { id: `web-${at.getTime()}`, sn: dev.sn, cam: dev.name, at };
-    ev = { cap, rec: cfg.vid ? pre.keep() : null };
-    onMotion(true);
-    if (!cfg.foto && !ev.rec) return;
+  const maybeEnd = () => {
+    if (!ev) return;
+    const now = performance.now();
+    if (now - ev.since > MAX || (!w.active && now - personAt > POST)) end();
+  };
+  const begin = async (boxes, person) => {
+    const at = new Date(), cap = { id: `web-${at.getTime()}`, sn: dev.sn, cam: dev.name, at, person };
+    const e = ev = { cap, rec: cfg.vid ? pre.keep() : null, since: performance.now() };
+    onMotion(true, person);
+    clearInterval(endT); endT = setInterval(maybeEnd, 1000);
+    if (!cfg.foto && !e.rec) return;
     S.caps.unshift(cap);
     for (const old of S.caps.splice(120)) { URL.revokeObjectURL(old.photo); URL.revokeObjectURL(old.video); }
+    // pixel motion: give the person detector a moment to say whether it is a person
+    if (!person && onP()) for (let k = 0; k < 15 && !cap.person && ev === e; k++) await new Promise(r => setTimeout(r, 100));
+    if (cap.person) boxes = personBoxes(people.length ? people : []);
     if (cfg.foto) {
       const blob = await snapshot(video, boxes).catch(() => null);
       if (blob) {
         cap.photo = URL.createObjectURL(blob);
-        if (cfg.dl) saveBlob(blob, `${dev.name} gerak ${fileStamp(at)}.jpg`);
+        if (cfg.dl) saveBlob(blob, `${dev.name} ${cap.person ? 'orang' : 'gerak'} ${fileStamp(at)}.jpg`);
         if (cfg.cloud) cloudSave(cap, 'photo', blob, 'image/jpeg');
       }
     }
     capHooks.forEach(f => f(cap));
   };
   const end = async () => {
-    onMotion(false);
+    onMotion(false, false);
+    clearInterval(endT);
     const e = ev; ev = null;
     if (!e?.rec) return;
     const clip = await pre.finish(e.rec);
     if (!clip) return;
     Object.assign(e.cap, { video: URL.createObjectURL(clip.blob), mime: clip.mime, secs: clip.secs, pre: clip.pre });
     capHooks.forEach(f => f(e.cap));
-    if (cfg.dl) saveBlob(clip.blob, `${dev.name} gerak ${fileStamp(e.cap.at)}.${clip.mime === 'video/mp4' ? 'mp4' : 'webm'}`);
+    if (cfg.dl) saveBlob(clip.blob, `${dev.name} ${e.cap.person ? 'orang' : 'gerak'} ${fileStamp(e.cap.at)}.${clip.mime === 'video/mp4' ? 'mp4' : 'webm'}`);
     if (cfg.cloud && clip.mime === 'video/mp4') cloudSave(e.cap, 'video', clip.blob, 'video/mp4', clip.secs);
   };
 
   const ctl = {
-    watcher: w,
+    watcher: w, eye,
     /** New stream is playing: fresh background, fresh recorders. */
     restart() {
       ctl.pause(); live = true;
-      if (!on()) return;
-      w.opt.level = cfg.level; w.start();
-      if (cfg.vid) { pre.pre = cfg.pre; pre.start(); }
+      if (on()) { w.opt.level = cfg.level; w.start(); }
+      if (onP()) { eye.opt.level = cfg.orang; eye.start(); }
+      if ((on() || onP()) && cfg.vid) { pre.pre = cfg.pre; pre.start(); }
     },
-    pause() { live = false; w.stop(); pre.stop(); },
-    stop() { ctl.pause(); onMotion(false); },
+    pause() { live = false; if (ev) end(); w.stop(); eye.stop(); pre.stop(); },
+    stop() { ctl.pause(); onMotion(false, false); },
     reload() { cfg = watchCfg(); if (live) ctl.restart(); },
   };
   player.watcher = ctl;
@@ -701,6 +735,7 @@ function attachWatch(player, overlay, { onMotion = () => {} } = {}) {
 function setWatch(patch) {
   const c = { ...watchCfg(), ...patch };
   if (patch.level && patch.level !== 'off') c.last = patch.level;
+  if (patch.orang && patch.orang !== 'off') c.lastO = patch.orang;
   store.set('watch', c);
   players.forEach(p => p.watcher?.reload());
 }
@@ -715,7 +750,7 @@ function drawCaps(box, sn) {
     : '<div class="muted small">Belum ada tangkapan. Gerakan berikutnya langsung difoto & direkam di sini.</div>';
   box.querySelectorAll('.capt').forEach(b => b.onclick = () => openViewer(list.map(c => ({
     video: !!c.video, poster: c.photo,
-    caption: `Gerak · ${c.cam} · ${timeLabel(c.at)}${c.video ? ` · ${Math.round(c.secs)} dtk (mulai ${Math.round(c.pre)} dtk sebelum gerak)` : ''}`,
+    caption: `${c.person ? 'Orang' : 'Gerak'} · ${c.cam} · ${timeLabel(c.at)}${c.video ? ` · ${Math.round(c.secs)} dtk (mulai ${Math.round(c.pre)} dtk sebelum gerak)` : ''}`,
     file: `${c.cam} gerak ${fileStamp(c.at)}.${c.video ? (c.mime === 'video/webm' ? 'webm' : 'mp4') : 'jpg'}`,
     resolve: async () => c.video || c.photo,
   })), +b.dataset.k));
@@ -782,7 +817,10 @@ function viewLive() {
           <select class="input" id="light" disabled><option>Memuat…</option></select></label>
         <details id="wd" open><summary>Deteksi gerak</summary>
           <div class="wset">
+            <div class="muted small">Gerakan (piksel)</div>
             <div class="seg" id="wl">${[['off', 'Mati'], ...Object.entries(LEVELS).map(([k, v]) => [k, v.name])].map(([k, v]) => `<button data-wl="${k}" class="${wc.level === k ? 'on' : ''}">${v}</button>`).join('')}</div>
+            <div class="muted small">Orang bergerak (AI di browser, semua kamera)</div>
+            <div class="seg" id="po">${[['off', 'Mati'], ...Object.entries(PLEVELS).map(([k, v]) => [k, v.name])].map(([k, v]) => `<button data-po="${k}" class="${wc.orang === k ? 'on' : ''}">${v}</button>`).join('')}</div>
             <label class="tog"><input type="checkbox" data-w="foto" ${wc.foto ? 'checked' : ''}><span>Foto otomatis + kotak sorot</span></label>
             <label class="tog"><input type="checkbox" data-w="vid" ${wc.vid && PreRoll.supported() ? 'checked' : ''} ${PreRoll.supported() ? '' : 'disabled'}><span>Video otomatis, mulai
               <select data-w="pre">${[3, 5, 10].map(n => `<option value="${n}" ${wc.pre === n ? 'selected' : ''}>${n}</option>`).join('')}</select> dtk sebelum gerak${PreRoll.supported() ? '' : ' (tidak didukung browser ini)'}</span></label>
@@ -820,7 +858,7 @@ function viewLive() {
   const label = () => {
     const q = player.stream === '0' ? 'Full HD' : 'SD';
     const lag = player.lag != null ? ` · jeda ${player.lag.toFixed(1)} dtk` : '';
-    const mo = stage.classList.contains('motion') ? '<b class="mo">● GERAK</b>' : '';
+    const mo = stage.classList.contains('person') ? '<b class="mo">● ORANG</b>' : stage.classList.contains('motion') ? '<b class="mo">● GERAK</b>' : '';
     $('#lb').innerHTML = `<i class="dot online"></i><span>LIVE · ${q} · ${player.mode === 'flv' ? 'Cepat' : 'Stabil'}${lag}</span>${mo}`;
   };
   const startPlayer = (stream) => {
@@ -836,7 +874,7 @@ function viewLive() {
         if (s === 'blocked') setMsg('Ketuk layar untuk memutar', false);
       },
     });
-    attachWatch(player, $('#ov'), { onMotion: m => { stage.classList.toggle('motion', m); if (m) label(); } });
+    attachWatch(player, $('#ov'), { onMotion: (m, pp) => { stage.classList.toggle('motion', m); stage.classList.toggle('person', !!(m && pp)); label(); } });
     player.start();
   };
   const q0 = quality === 'auto' ? (Math.min(innerWidth, innerHeight) < 600 ? '1' : '0') : quality;
@@ -966,6 +1004,10 @@ function viewLive() {
   const wt = () => { const c = watchCfg(); $('#wt').classList.toggle('on', c.level !== 'off'); document.querySelectorAll('[data-wl]').forEach(b => b.classList.toggle('on', b.dataset.wl === c.level)); };
   $('#wt').onclick = () => { const c = watchCfg(); setWatch({ level: c.level === 'off' ? c.last || 'agresif' : 'off' }); wt(); toast(watchCfg().level === 'off' ? 'Deteksi gerak dimatikan' : `Deteksi gerak: ${LEVELS[watchCfg().level].name}`); };
   document.querySelectorAll('[data-wl]').forEach(b => b.onclick = () => { setWatch({ level: b.dataset.wl }); wt(); });
+  document.querySelectorAll('[data-po]').forEach(b => b.onclick = () => {
+    setWatch({ orang: b.dataset.po });
+    document.querySelectorAll('[data-po]').forEach(x => x.classList.toggle('on', x === b));
+  });
   document.querySelectorAll('input[data-w]').forEach(i => i.onchange = () => setWatch({ [i.dataset.w]: i.checked }));
   $('select[data-w="pre"]').onchange = e => setWatch({ pre: +e.target.value });
   const capsBox = $('#caps'), onCap = c => { if (!$('#caps')) return capHooks.delete(onCap); if (c.sn === d.sn) drawCaps(capsBox, d.sn); };
@@ -1026,6 +1068,7 @@ function viewMulti() {
   const cols = n === 1 ? 1 : Math.min(n, Math.ceil(Math.sqrt(cams.length))), rows = Math.ceil(cams.length / cols) || 1;
   $('#main').innerHTML = `
     ${topbar('Multi Layar', `
+      <button class="btn icon ${watchCfg().orang !== 'off' ? 'on' : ''}" id="mo" title="Deteksi orang bergerak (AI) di semua layar">${ic('user')}</button>
       <button class="btn icon ${watchCfg().level !== 'off' ? 'on' : ''}" id="mw" title="Deteksi gerak di semua layar">${ic('radar')}</button>
       <button class="btn icon ${cover ? 'on' : ''}" id="mc" title="Isi penuh (potong tepi)">${ic('full')}</button>
       <div class="seg">${[1, 2, 3].map(k => `<button data-n="${k}" class="${k === n ? 'on' : ''}">${k === 1 ? '1' : `${k}×${k}`}</button>`).join('')}</div>`)}
@@ -1036,6 +1079,12 @@ function viewMulti() {
   document.querySelectorAll('.seg [data-n]').forEach(b => b.onclick = () => { store.set('multiN', +b.dataset.n); route(); });
   $('#mc').onclick = () => { const on = !$('.multi').classList.contains('cover'); $('.multi').classList.toggle('cover', on); $('#mc').classList.toggle('on', on); store.set('multiCover', on); };
   $('.mexit').onclick = () => go('cams');
+  $('#mo').onclick = () => {
+    const c = watchCfg();
+    setWatch({ orang: c.orang === 'off' ? c.lastO || 'agresif' : 'off' });
+    $('#mo').classList.toggle('on', watchCfg().orang !== 'off');
+    toast(watchCfg().orang === 'off' ? 'Deteksi orang dimatikan' : `Deteksi orang ${PLEVELS[watchCfg().orang].name} di semua layar`);
+  };
   $('#mw').onclick = () => {
     const c = watchCfg();
     setWatch({ level: c.level === 'off' ? c.last || 'agresif' : 'off' });
@@ -1051,7 +1100,7 @@ function viewMulti() {
         t.classList.toggle('wait', s === 'connect' || s === 'retry');
       },
     });
-    attachWatch(p, t.querySelector('.ov'), { onMotion: m => t.classList.toggle('motion', m) });
+    attachWatch(p, t.querySelector('.ov'), { onMotion: (m, pp) => { t.classList.toggle('motion', m); t.classList.toggle('person', !!(m && pp)); } });
     p.start();
     t.onclick = () => go('live', d.sn);
   });
