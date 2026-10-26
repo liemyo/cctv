@@ -233,6 +233,10 @@ details summary { cursor: pointer; color: var(--ink2); font-size: 13px; }
 .seg button.on { background: var(--accent); color: #fff; }
 code.k { font: 12px ui-monospace, Menlo, monospace; word-break: break-all; }
 
+.tapplay {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 90; min-height: 52px; padding: 0 24px;
+  font-weight: 600; box-shadow: var(--shadow);
+}
 .toast {
   position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 99;
   padding: 10px 18px; border-radius: 99px; max-width: calc(100% - 32px); text-align: center;
@@ -244,6 +248,6 @@ code.k { font: 12px ui-monospace, Menlo, monospace; word-break: break-all; }
 </head>
 <body>
 <div id="root"></div>
-<script type="module" src="app.js?v=1"></script>
+<script type="module" src="app.js?v=2"></script>
 </body>
 </html>

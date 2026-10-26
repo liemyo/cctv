@@ -226,7 +226,29 @@ class LivePlayer {
     this.video = video; this.dev = dev; this.stream = stream; this.muted = muted; this.onState = onState;
     this.fails = 0; this.mode = store.get('mode', 'auto') === 'hls' || !hevcMSE() || !window.mpegts ? 'hls' : 'flv';
     video.muted = muted; video.playsInline = true; video.crossOrigin = 'anonymous';
+    this.onReady = () => this.kick();
+    video.addEventListener('loadeddata', this.onReady);
+    video.addEventListener('canplay', this.onReady);
     players.add(this);
+  }
+
+  /** Starts / resumes playback. Safari rejects play() issued before the stream has data (and never retries it),
+   *  so this runs again when data arrives and from the watchdog. A real autoplay block asks for a tap. */
+  kick() {
+    const v = this.video;
+    if (this.stopped || !v.paused || v.readyState < 2) return;
+    v.play().then(() => { if (this.blocked) { this.blocked = false; autoplayHint(); } }).catch(e => {
+      if (e?.name === 'NotAllowedError' && !this.stopped) { this.blocked = true; autoplayHint(); }
+    });
+  }
+
+  /** Jump to the live edge when playback has fallen behind (tab in background, slow decode, stalls). */
+  toEdge() {
+    const v = this.video;
+    if (!v.buffered.length) return;
+    const end = v.buffered.end(v.buffered.length - 1);
+    const max = this.mode === 'flv' ? 1.5 : 5, keep = this.mode === 'flv' ? 0.3 : 1.5;
+    if (end - v.currentTime > max) v.currentTime = end - keep;
   }
 
   async start() {
@@ -259,7 +281,6 @@ class LivePlayer {
     p.on(mpegts.Events.ERROR, (type, detail) => { this.fails++; this.retry(`Siaran terputus (${detail || type})`); });
     p.attachMediaElement(this.video);
     p.load();
-    this.video.play().catch(() => {});
   }
 
   playHLS(url) {
@@ -270,7 +291,6 @@ class LivePlayer {
     } else {
       this.video.src = url;
     }
-    this.video.play().catch(() => {});
   }
 
   /** Watchdog: no picture within 14 s, or picture frozen 10 s → reconnect; FLV falls back to HLS after 2 failures. */
@@ -279,15 +299,19 @@ class LivePlayer {
     clearInterval(this.timer);
     this.timer = setInterval(() => {
       if (gen !== this.gen) return;
-      const v = this.video, t = v.currentTime;
+      const v = this.video;
+      if (v.paused && v.readyState >= 2) this.kick();
+      this.toEdge();
+      const t = v.currentTime;
       if (t > 0 && t !== last) {
         still = 0; last = t;
         if (!started) { started = true; this.fails = 0; this.onState('play'); }
         // latency readout (seconds of buffered video not yet shown)
         const b = v.buffered.length ? v.buffered.end(v.buffered.length - 1) - t : 0;
         this.lag = b;
-        if (this.mode === 'hls' && b > 6) v.currentTime = v.buffered.end(v.buffered.length - 1) - 2;
         this.onState('tick', b);
+      } else if (this.blocked) {
+        this.onState('blocked');
       } else {
         still += 1;
         if (still >= (started ? 10 : 14)) { this.fails++; this.retry(started ? 'Gambar berhenti — menyambung ulang…' : 'Kamera tidak mengirim gambar'); }
@@ -304,7 +328,7 @@ class LivePlayer {
     this.rt = setTimeout(() => this.start(), Math.min(2000 + this.fails * 1500, 8000));
   }
 
-  setMuted(m) { this.muted = m; this.video.muted = m; if (!m) this.video.play().catch(() => {}); }
+  setMuted(m) { this.muted = m; this.video.muted = m; this.kick(); }
 
   teardown() {
     clearInterval(this.timer); clearTimeout(this.rt);
@@ -314,8 +338,31 @@ class LivePlayer {
     if (this.video.src && !this.video.src.startsWith('blob:')) { this.video.removeAttribute('src'); this.video.load(); }
   }
 
-  stop() { this.stopped = true; this.gen++; this.teardown(); players.delete(this); }
+  stop() {
+    this.stopped = true; this.gen++; this.teardown(); players.delete(this);
+    this.video.removeEventListener('loadeddata', this.onReady);
+    this.video.removeEventListener('canplay', this.onReady);
+    if (this.blocked) { this.blocked = false; autoplayHint(); }
+  }
 }
+
+/** Shown while the browser refuses to start video on its own (e.g. iPhone Low Power Mode): one tap starts all. */
+function autoplayHint() {
+  const need = [...players].some(p => p.blocked);
+  let el = $('#tapplay');
+  if (!need) { el?.remove(); return; }
+  if (el) return;
+  el = document.createElement('button');
+  el.id = 'tapplay'; el.className = 'btn primary tapplay';
+  el.innerHTML = `${ic('play')}<span>Ketuk untuk memutar video</span>`;
+  el.onclick = () => {
+    players.forEach(p => { p.blocked = false; p.toEdge(); p.video.play().catch(() => {}); });
+    autoplayHint();
+  };
+  document.body.append(el);
+}
+document.addEventListener('pointerdown', () => players.forEach(p => p.blocked && p.kick()), true);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) players.forEach(p => { p.toEdge(); p.kick(); }); });
 
 // ---------- live view ----------
 
@@ -396,6 +443,7 @@ function viewLive() {
         if (s === 'retry') { setMsg(x); $('#lb').innerHTML = '<i class="dot offline"></i><span>Terputus</span>'; }
         if (s === 'play') { setMsg(null); label(); }
         if (s === 'tick') label();
+        if (s === 'blocked') setMsg('Ketuk layar untuk memutar', false);
       },
     });
     player.start();
@@ -822,7 +870,8 @@ if (new URLSearchParams(location.search).has('demo')) {
     alarmPictures: async () => ({}),
     liveURL: async (d, o) => {
       const u = await fetch('_test/urls.json').then(r => r.json()).catch(() => ({}));
-      const url = u[o.protocol === 'flv' ? (o.stream === '0' ? 'flvHD' : 'flvSD') : 'hlsSD'];
+      const k = o.protocol === 'flv' ? (o.stream === '0' ? 'flvHD' : 'flvSD') : 'hlsSD';
+      const url = u[`${k}_${devs.indexOf(d)}`] || u[k];
       if (!url) throw new Error('Demo: tidak ada siaran');
       return url;
     },
