@@ -435,9 +435,13 @@ class LivePlayer {
       x.imageSmoothingQuality = 'high';
       x.drawImage(v, 0, 0, 128, 72);
       const d = x.getImageData(0, 0, 128, 72).data;
-      let h = 0;
-      for (let i = 0; i < d.length; i += 4) h = (h * 31 + d[i] + d[i + 1] * 3 + d[i + 2] * 7) | 0;
-      return h;
+      let h = 0, lo = 255, hi = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        h = (h * 31 + d[i] + d[i + 1] * 3 + d[i + 2] * 7) | 0;
+        if (d[i + 1] < lo) lo = d[i + 1]; if (d[i + 1] > hi) hi = d[i + 1];
+      }
+      // a flat sample is a blank draw (Safari can't always paint HLS video to a canvas), not a picture
+      return hi - lo < 3 ? null : h;
     } catch { this.noPrint = true; return null; } // tainted (cross-origin native HLS): rely on frame counts
   }
 
