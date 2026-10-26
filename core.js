@@ -146,6 +146,14 @@ const EVENTS = {
   appEventCryDetectAlarm: 'Tangisan terdeteksi', BabyCry: 'Tangisan terdeteksi',
   VideoBlind: 'Kamera tertutup',
 };
+// Camera-side detector presets (Detect.MotionDetect Level 1–6, EventLatch = seconds between alarms,
+// HumanDetection Sensitivity 0–2 + ShowTrack box drawn by the camera, DetectTrack Sensitivity 0–2).
+export const SENS = {
+  normal: { name: 'Normal', level: 3, latch: 2, human: 1, track: 1, box: false, push: 3000 },
+  tinggi: { name: 'Tinggi', level: 5, latch: 1, human: 2, track: 1, box: false, push: 2000 },
+  agresif: { name: 'Agresif', level: 6, latch: 0, human: 2, track: 2, box: true, push: 1000 },
+};
+
 export const eventLabel = raw => { const e = String(raw || '').split(':')[0]; return EVENTS[e] || e || 'Alarm'; };
 
 export function parseStamp(s) {
@@ -359,6 +367,39 @@ export class JFClient {
   }
   deletePreset(dev, id) { return this.ptzCommand(dev, 'ClearPreset', id); }
 
+  /** The camera's own detectors: motion Level 1–6, alarm interval (EventLatch s), human Sensitivity 0–2, tracking Sensitivity 0–2. */
+  async sensitivity(dev) {
+    const m = await this.config(dev, 'Detect.MotionDetect.[0]');
+    const h = await this.config(dev, 'Detect.HumanDetection.[0]').catch(() => null);
+    const t = await this.config(dev, 'Detect.DetectTrack').catch(() => null);
+    const s = {
+      on: !!m?.Enable, level: m?.Level ?? 3, latch: m?.EventHandler?.EventLatch ?? null,
+      human: h?.Enable ? h.Sensitivity : null, box: !!h?.ShowTrack, push: h?.PushInterval ?? null,
+      track: t ? t.Sensitivity : null, tracking: !!t?.Enable,
+    };
+    s.preset = Object.keys(SENS).reverse().find(k => s.on && s.level >= SENS[k].level && (s.human == null || s.human >= SENS[k].human)) || 'custom';
+    return s;
+  }
+
+  /** Read-modify-write of the three detector configs to a SENS preset. Tracking stays on/off as it was (it moves the camera). */
+  async setSensitivity(dev, key) {
+    const p = SENS[key];
+    const m = await this.config(dev, 'Detect.MotionDetect.[0]');
+    m.Enable = true; m.Level = p.level;
+    m.EventHandler = { ...m.EventHandler, EventLatch: p.latch, Dejitter: 0, MessageEnable: true, SnapEnable: true };
+    if (key === 'agresif' && Array.isArray(m.Region)) m.Region = m.Region.map(() => '0xFFFFFFFF'); // whole picture
+    await this.setConfig(dev, 'Detect.MotionDetect.[0]', m);
+    const h = await this.config(dev, 'Detect.HumanDetection.[0]').catch(() => null);
+    if (h) {
+      Object.assign(h, { Enable: true, Sensitivity: p.human, ShowTrack: p.box });
+      try { await this.setConfig(dev, 'Detect.HumanDetection.[0]', { ...h, PushInterval: p.push }); }
+      catch { await this.setConfig(dev, 'Detect.HumanDetection.[0]', h).catch(() => {}); }
+    }
+    const t = await this.config(dev, 'Detect.DetectTrack').catch(() => null);
+    if (t) { t.Sensitivity = p.track; await this.setConfig(dev, 'Detect.DetectTrack', t).catch(() => {}); }
+    return this.sensitivity(dev);
+  }
+
   async info(dev, name = 'SystemInfo') {
     await this.deviceLogin(dev);
     const data = await this.deviceCall('getinfo', dev, { Name: name });
@@ -493,6 +534,18 @@ export class CloudStore {
     }
     return null;
   }
+
+  async path(sn, name) { return `${await this.owner()}/${sn}/${name}`; }
+
+  async upload(path, blob, mime) {
+    const r = await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}/${path}`, {
+      method: 'POST', body: blob, headers: this.headers({ 'Content-Type': mime, 'cache-control': 'max-age=31536000' }),
+    });
+    if (!r.ok && r.status !== 409) throw new JFError(r.status, `Cloud ${r.status}`);
+  }
+
+  /** Insert / merge one event row (same alarm_id merges photo, video and secs). */
+  async put(ev) { return (await this.rpc('pantau_put', { p_ev: ev })).id; }
 
   async remove(ids) {
     const j = await this.rpc('pantau_del', { p_ids: ids });

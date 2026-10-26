@@ -1,10 +1,11 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel } from './core.js?v=2';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=3';
+import { Watcher, PreRoll, LEVELS, snapshot } from './watch.js?v=1';
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 // Settings in SYNC are also saved to the cloud (with the Klip Gerak key) so every browser gets them.
-const SYNC = ['theme', 'skin', 'glass', 'mode', 'quality', 'invert', 'panelOff', 'sideOff', 'multiN', 'multiCover', 'klipCam', 'pesanCam', 'pesanDays'];
+const SYNC = ['theme', 'skin', 'glass', 'mode', 'quality', 'invert', 'panelOff', 'sideOff', 'multiN', 'multiCover', 'klipCam', 'pesanCam', 'pesanDays', 'watch'];
 const store = {
   get(k, d = null) { try { const v = localStorage.getItem('pantau.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
   raw(k, v) { try { v == null ? localStorage.removeItem('pantau.' + k) : localStorage.setItem('pantau.' + k, JSON.stringify(v)); } catch {} },
@@ -36,6 +37,7 @@ const ICON = {
   prev: '<path d="m15 5-7 7 7 7"/>', next: '<path d="m9 5 7 7-7 7"/>',
   sidebar: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/>',
   sliders: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
+  radar: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><path d="M12 12 18 6"/><circle cx="12" cy="12" r="1" fill="currentColor"/>',
   move: '<path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3"/>',
 };
 const ic = (n, cls = '') => `<svg class="i ${cls}" viewBox="0 0 24 24">${ICON[n] || ''}</svg>`;
@@ -441,7 +443,7 @@ class LivePlayer {
       lastF = f; lastT = t;
       if (moving) {
         still = 0;
-        if (!started) { started = true; this.fails = 0; this.onState('play'); }
+        if (!started) { started = true; this.fails = 0; this.onState('play'); this.watcher?.restart(); }
         // latency readout (seconds of buffered video not yet shown)
         const b = v.buffered.length ? v.buffered.end(v.buffered.length - 1) - t : 0;
         this.lag = b;
@@ -464,6 +466,7 @@ class LivePlayer {
 
   retry(why) {
     if (this.stopped) return;
+    this.watcher?.pause();
     if (this.mode === 'flv' && this.fails >= 2 && store.get('mode', 'auto') !== 'flv') { this.mode = 'hls'; this.fails = 0; why += ' — beralih ke mode stabil'; }
     this.onState('retry', why);
     this.teardown();
@@ -482,7 +485,7 @@ class LivePlayer {
   }
 
   stop() {
-    this.stopped = true; this.gen++; this.teardown(); players.delete(this);
+    this.stopped = true; this.gen++; this.watcher?.stop(); this.teardown(); players.delete(this);
     this.video.removeEventListener('loadeddata', this.onReady);
     this.video.removeEventListener('canplay', this.onReady);
     if (this.blocked) { this.blocked = false; autoplayHint(); }
@@ -515,6 +518,113 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('pageshow', e => { if (e.persisted) players.forEach(p => p.start()); });
 window.addEventListener('online', () => players.forEach(p => p.start()));
 
+// ---------- motion watcher (detector + pre-roll in watch.js) ----------
+
+// level: 'off' | LEVELS key. foto/vid = save a photo / clip per motion, pre = seconds recorded before it,
+// cloud = upload to Klip Gerak (photo + mp4), dl = also download to this device.
+const WATCH0 = { level: 'agresif', last: 'agresif', foto: true, vid: true, pre: 5, cloud: true, dl: false };
+const watchCfg = () => ({ ...WATCH0, ...store.get('watch', {}) });
+S.caps = []; // this visit's captures, newest first: {id, sn, cam, at, photo, video, secs, pre} (object URLs)
+const capHooks = new Set();
+let cloudWarned = false;
+
+async function cloudSave(cap, kind, blob, mime, secs) {
+  const cs = cloud();
+  if (!cs) return;
+  try {
+    const path = await cs.path(cap.sn, `${cap.id}.${kind === 'video' ? 'mp4' : 'jpg'}`);
+    await cs.upload(path, blob, mime);
+    const ev = { sn: cap.sn, cam: cap.cam, event: 'VideoMotion', alarm_id: cap.id, at: cap.at.toISOString(), bytes: blob.size, [kind]: path };
+    if (secs) ev.secs = secs;
+    await cs.put(ev);
+    cap.cloud = true;
+    capHooks.forEach(f => f(cap));
+  } catch (e) {
+    console.warn('cloud', e);
+    if (!cloudWarned) { cloudWarned = true; toast(`Klip Gerak cloud gagal: ${e.message}`); }
+  }
+}
+
+/** Runs the detector on a player's video. onMotion(bool) for the red frame / badge. */
+function attachWatch(player, overlay, { onMotion = () => {} } = {}) {
+  const dev = player.dev, video = player.video;
+  let cfg = watchCfg(), ev = null, live = false;
+  const w = new Watcher(video, overlay, {
+    level: cfg.level, post: 6, max: 60,
+    onStart: boxes => begin(boxes), onEnd: () => end(),
+  });
+  const pre = new PreRoll(video, { pre: cfg.pre, bits: player.stream === '0' ? 3e6 : 1.2e6 });
+  const on = () => cfg.level !== 'off';
+
+  const begin = async boxes => {
+    const at = new Date(), cap = { id: `web-${at.getTime()}`, sn: dev.sn, cam: dev.name, at };
+    ev = { cap, rec: cfg.vid ? pre.keep() : null };
+    onMotion(true);
+    if (!cfg.foto && !ev.rec) return;
+    S.caps.unshift(cap);
+    for (const old of S.caps.splice(120)) { URL.revokeObjectURL(old.photo); URL.revokeObjectURL(old.video); }
+    if (cfg.foto) {
+      const blob = await snapshot(video, boxes).catch(() => null);
+      if (blob) {
+        cap.photo = URL.createObjectURL(blob);
+        if (cfg.dl) saveBlob(blob, `${dev.name} gerak ${fileStamp(at)}.jpg`);
+        if (cfg.cloud) cloudSave(cap, 'photo', blob, 'image/jpeg');
+      }
+    }
+    capHooks.forEach(f => f(cap));
+  };
+  const end = async () => {
+    onMotion(false);
+    const e = ev; ev = null;
+    if (!e?.rec) return;
+    const clip = await pre.finish(e.rec);
+    if (!clip) return;
+    Object.assign(e.cap, { video: URL.createObjectURL(clip.blob), mime: clip.mime, secs: clip.secs, pre: clip.pre });
+    capHooks.forEach(f => f(e.cap));
+    if (cfg.dl) saveBlob(clip.blob, `${dev.name} gerak ${fileStamp(e.cap.at)}.${clip.mime === 'video/mp4' ? 'mp4' : 'webm'}`);
+    if (cfg.cloud && clip.mime === 'video/mp4') cloudSave(e.cap, 'video', clip.blob, 'video/mp4', clip.secs);
+  };
+
+  const ctl = {
+    watcher: w,
+    /** New stream is playing: fresh background, fresh recorders. */
+    restart() {
+      ctl.pause(); live = true;
+      if (!on()) return;
+      w.opt.level = cfg.level; w.start();
+      if (cfg.vid) { pre.pre = cfg.pre; pre.start(); }
+    },
+    pause() { live = false; w.stop(); pre.stop(); },
+    stop() { ctl.pause(); onMotion(false); },
+    reload() { cfg = watchCfg(); if (live) ctl.restart(); },
+  };
+  player.watcher = ctl;
+  return ctl;
+}
+
+function setWatch(patch) {
+  const c = { ...watchCfg(), ...patch };
+  if (patch.level && patch.level !== 'off') c.last = patch.level;
+  store.set('watch', c);
+  players.forEach(p => p.watcher?.reload());
+}
+
+/** Thumbnails of this visit's captures; opens them in the viewer. */
+function drawCaps(box, sn) {
+  if (!box) return;
+  const list = S.caps.filter(c => !sn || c.sn === sn);
+  box.innerHTML = list.length ? list.slice(0, 24).map((c, k) => `<button class="capt" data-k="${k}" title="${esc(c.cam)} · ${timeLabel(c.at)}">
+      ${c.photo ? `<img src="${c.photo}" alt="">` : ic('film')}
+      ${c.video ? `<span class="play">${ic('play')}</span>` : ''}<span class="t">${timeLabel(c.at)}${c.cloud ? ' ☁' : ''}</span></button>`).join('')
+    : '<div class="muted small">Belum ada tangkapan. Gerakan berikutnya langsung difoto & direkam di sini.</div>';
+  box.querySelectorAll('.capt').forEach(b => b.onclick = () => openViewer(list.map(c => ({
+    video: !!c.video, poster: c.photo,
+    caption: `Gerak · ${c.cam} · ${timeLabel(c.at)}${c.video ? ` · ${Math.round(c.secs)} dtk (mulai ${Math.round(c.pre)} dtk sebelum gerak)` : ''}`,
+    file: `${c.cam} gerak ${fileStamp(c.at)}.${c.video ? (c.mime === 'video/webm' ? 'webm' : 'mp4') : 'jpg'}`,
+    resolve: async () => c.video || c.photo,
+  })), +b.dataset.k));
+}
+
 // ---------- live view ----------
 
 const INVERT = { 0: 'Normal', 1: 'Balik semua arah', 2: 'Balik kiri ↔ kanan', 3: 'Balik atas ↕ bawah' };
@@ -534,6 +644,7 @@ function viewLive() {
   const others = S.devices.filter(x => x.sn !== d.sn);
   const quality = store.get('quality', 'auto');
   const inv = store.get('invert', {})[d.sn] ?? 1;
+  const wc = watchCfg();
   const pad = `<div class="pad">
       <span></span><button class="btn" data-dir="DirectionUp">${ic('up')}</button><span></span>
       <button class="btn" data-dir="DirectionLeft">${ic('left')}</button><span class="c">tahan</span><button class="btn" data-dir="DirectionRight">${ic('right')}</button>
@@ -547,6 +658,7 @@ function viewLive() {
     <div class="live ${store.get('panelOff', false) ? 'nopanel' : ''}" id="live">
       <div class="stage" id="stage">
         <video id="vid" playsinline muted autoplay></video>
+        <canvas class="ov" id="ov"></canvas>
         <div class="tl"><button class="btn icon lback" id="bk2" title="Kembali">${ic('back')}</button>
           <span class="badge" id="lb"><i class="dot"></i><span>…</span></span></div>
         <div class="msg" id="msg"><div><div class="spin"></div><div id="msgt">Menyambung…</div></div></div>
@@ -558,6 +670,7 @@ function viewLive() {
           </select>
           <span class="spacer"></span>
           <button class="btn icon ptzb" id="ptzb" title="Gerak kamera">${ic('move')}</button>
+          <button class="btn icon ${wc.level !== 'off' ? 'on' : ''}" id="wt" title="Deteksi gerak (sorot, foto & video otomatis)">${ic('radar')}</button>
           <button class="btn icon" id="shot" title="Foto">${ic('shot')}</button>
           <button class="btn icon" id="rec" title="Rekam">${ic('rec')}</button>
           <button class="btn icon" id="fill" title="Isi layar">${ic('grid')}</button>
@@ -571,6 +684,22 @@ function viewLive() {
           <select class="input" id="inv">${Object.entries(INVERT).map(([k, v]) => `<option value="${k}" ${+k === inv ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
         <label class="field"><span>Lampu malam</span>
           <select class="input" id="light" disabled><option>Memuat…</option></select></label>
+        <details id="wd" open><summary>Deteksi gerak</summary>
+          <div class="wset">
+            <div class="seg" id="wl">${[['off', 'Mati'], ...Object.entries(LEVELS).map(([k, v]) => [k, v.name])].map(([k, v]) => `<button data-wl="${k}" class="${wc.level === k ? 'on' : ''}">${v}</button>`).join('')}</div>
+            <label class="tog"><input type="checkbox" data-w="foto" ${wc.foto ? 'checked' : ''}><span>Foto otomatis + kotak sorot</span></label>
+            <label class="tog"><input type="checkbox" data-w="vid" ${wc.vid && PreRoll.supported() ? 'checked' : ''} ${PreRoll.supported() ? '' : 'disabled'}><span>Video otomatis, mulai
+              <select data-w="pre">${[3, 5, 10].map(n => `<option value="${n}" ${wc.pre === n ? 'selected' : ''}>${n}</option>`).join('')}</select> dtk sebelum gerak${PreRoll.supported() ? '' : ' (tidak didukung browser ini)'}</span></label>
+            <label class="tog"><input type="checkbox" data-w="cloud" ${wc.cloud ? 'checked' : ''}><span>Simpan ke Klip Gerak (cloud)</span></label>
+            <label class="tog"><input type="checkbox" data-w="dl" ${wc.dl ? 'checked' : ''}><span>Unduh otomatis ke perangkat ini</span></label>
+            <div class="caps" id="caps"></div>
+          </div></details>
+        <details id="sensd" ${innerWidth > 820 ? 'open' : ''}><summary>Sensor kamera</summary>
+          <div class="wset">
+            <div class="seg" id="sens">${Object.entries(SENS).map(([k, v]) => `<button data-sens="${k}" disabled>${v.name}</button>`).join('')}</div>
+            <div class="muted small" id="sensinfo">Memuat…</div>
+            <button class="btn" id="sensall">${ic('radar')}<span>Agresif di semua kamera</span></button>
+          </div></details>
         <details id="favd" ${innerWidth > 820 ? 'open' : ''}><summary>Posisi favorit</summary>
           <div style="display:grid;gap:6px">
             <button class="btn" id="addp">${ic('star')}<span>Simpan posisi ini</span></button>
@@ -595,7 +724,8 @@ function viewLive() {
   const label = () => {
     const q = player.stream === '0' ? 'Full HD' : 'SD';
     const lag = player.lag != null ? ` · jeda ${player.lag.toFixed(1)} dtk` : '';
-    $('#lb').innerHTML = `<i class="dot online"></i><span>LIVE · ${q} · ${player.mode === 'flv' ? 'Cepat' : 'Stabil'}${lag}</span>`;
+    const mo = stage.classList.contains('motion') ? '<b class="mo">● GERAK</b>' : '';
+    $('#lb').innerHTML = `<i class="dot online"></i><span>LIVE · ${q} · ${player.mode === 'flv' ? 'Cepat' : 'Stabil'}${lag}</span>${mo}`;
   };
   const startPlayer = (stream) => {
     player?.stop();
@@ -609,6 +739,7 @@ function viewLive() {
         if (s === 'blocked') setMsg('Ketuk layar untuk memutar', false);
       },
     });
+    attachWatch(player, $('#ov'), { onMotion: m => { stage.classList.toggle('motion', m); if (m) label(); } });
     player.start();
   };
   const q0 = quality === 'auto' ? (Math.min(innerWidth, innerHeight) < 600 ? '1' : '0') : quality;
@@ -675,12 +806,14 @@ function viewLive() {
     const down = ev => {
       ev.preventDefault(); b.setPointerCapture?.(ev.pointerId);
       active = mapDir(b.dataset.dir, invert); b.classList.add('held');
+      player.watcher?.watcher.hold(60000);
       api.ptz(d, active, false).catch(handleErr);
     };
     const up = () => {
       if (!active) return;
       const dir = active; active = null; b.classList.remove('held');
       setTimeout(() => api.ptz(d, dir, true).catch(() => {}), 120);
+      player.watcher?.watcher.hold(2500);
     };
     b.addEventListener('pointerdown', down);
     b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up); b.addEventListener('lostpointercapture', up);
@@ -732,11 +865,46 @@ function viewLive() {
       };
     } catch { if ($('#light')) sel.innerHTML = '<option>Tidak tersedia</option>'; }
   })();
+  // Motion watcher settings + captures
+  const wt = () => { const c = watchCfg(); $('#wt').classList.toggle('on', c.level !== 'off'); document.querySelectorAll('[data-wl]').forEach(b => b.classList.toggle('on', b.dataset.wl === c.level)); };
+  $('#wt').onclick = () => { const c = watchCfg(); setWatch({ level: c.level === 'off' ? c.last || 'agresif' : 'off' }); wt(); toast(watchCfg().level === 'off' ? 'Deteksi gerak dimatikan' : `Deteksi gerak: ${LEVELS[watchCfg().level].name}`); };
+  document.querySelectorAll('[data-wl]').forEach(b => b.onclick = () => { setWatch({ level: b.dataset.wl }); wt(); });
+  document.querySelectorAll('input[data-w]').forEach(i => i.onchange = () => setWatch({ [i.dataset.w]: i.checked }));
+  $('select[data-w="pre"]').onchange = e => setWatch({ pre: +e.target.value });
+  const capsBox = $('#caps'), onCap = c => { if (!$('#caps')) return capHooks.delete(onCap); if (c.sn === d.sn) drawCaps(capsBox, d.sn); };
+  capHooks.add(onCap);
+  drawCaps(capsBox, d.sn);
+
+  // Camera's own detectors (cloud config)
+  const sensDraw = s => {
+    if (!$('#sens')) return;
+    document.querySelectorAll('[data-sens]').forEach(b => { b.disabled = false; b.classList.toggle('on', b.dataset.sens === s.preset); });
+    const hum = ['rendah', 'sedang', 'tinggi'][s.human];
+    $('#sensinfo').innerHTML = !s.on ? 'Deteksi gerak kamera <b>mati</b>.' : `Gerak level <b>${s.level}/6</b> · jeda alarm ${s.latch ?? '?'} dtk`
+      + `${hum ? ` · manusia ${hum}` : ''}${s.box ? ' · kotak manusia di video' : ''}${s.track != null ? ` · ikuti objek ${s.tracking ? 'nyala' : 'mati'}` : ''}`;
+  };
+  api.sensitivity(d).then(sensDraw).catch(() => { if ($('#sensinfo')) $('#sensinfo').textContent = 'Tidak tersedia untuk kamera ini'; });
+  document.querySelectorAll('[data-sens]').forEach(b => b.onclick = async () => {
+    document.querySelectorAll('[data-sens]').forEach(x => x.disabled = true);
+    try { sensDraw(await api.setSensitivity(d, b.dataset.sens)); toast(`Sensor kamera: ${SENS[b.dataset.sens].name}`); }
+    catch (e) { handleErr(e); document.querySelectorAll('[data-sens]').forEach(x => x.disabled = false); }
+  });
+  $('#sensall').onclick = async () => {
+    const btn = $('#sensall'); btn.disabled = true;
+    let ok = 0;
+    for (const x of S.devices) {
+      btn.querySelector('span').textContent = `Mengatur ${x.name}…`;
+      try { const s = await api.setSensitivity(x, 'agresif'); ok++; if (x.sn === d.sn) sensDraw(s); } catch (e) { console.warn(e); }
+    }
+    if (!$('#sensall')) return;
+    btn.disabled = false; btn.querySelector('span').textContent = 'Agresif di semua kamera';
+    toast(`Sensor Agresif aktif di ${ok} dari ${S.devices.length} kamera`);
+  };
   $('#info').textContent = `SN ${d.sn}`;
 }
 
-function fileStamp() {
-  const t = new Date(), p = n => String(n).padStart(2, '0');
+function fileStamp(t = new Date()) {
+  const p = n => String(n).padStart(2, '0');
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}.${p(t.getMinutes())}.${p(t.getSeconds())}`;
 }
 
@@ -761,21 +929,29 @@ function viewMulti() {
   const cols = n === 1 ? 1 : Math.min(n, Math.ceil(Math.sqrt(cams.length))), rows = Math.ceil(cams.length / cols) || 1;
   $('#main').innerHTML = `
     ${topbar('Multi Layar', `
+      <button class="btn icon ${watchCfg().level !== 'off' ? 'on' : ''}" id="mw" title="Deteksi gerak di semua layar">${ic('radar')}</button>
       <button class="btn icon ${cover ? 'on' : ''}" id="mc" title="Isi penuh (potong tepi)">${ic('full')}</button>
       <div class="seg">${[1, 2, 3].map(k => `<button data-n="${k}" class="${k === n ? 'on' : ''}">${k === 1 ? '1' : `${k}×${k}`}</button>`).join('')}</div>`)}
     <div class="multi ${cover ? 'cover' : ''}" style="--mcols:repeat(${cols},minmax(0,1fr));--mrows:repeat(${rows},minmax(0,1fr));--pcols:repeat(${n === 1 ? 1 : 2},minmax(0,1fr))">${cams.map(d => `
-      <div class="tile" data-sn="${esc(d.sn)}"><video playsinline muted autoplay></video>
+      <div class="tile" data-sn="${esc(d.sn)}"><video playsinline muted autoplay></video><canvas class="ov"></canvas>
         <span class="badge"><i class="dot"></i>${esc(d.name)}</span></div>`).join('')}</div>
     <button class="btn icon mexit" data-go="cams" title="Tutup">${ic('x')}</button>`;
   document.querySelectorAll('.seg [data-n]').forEach(b => b.onclick = () => { store.set('multiN', +b.dataset.n); route(); });
   $('#mc').onclick = () => { const on = !$('.multi').classList.contains('cover'); $('.multi').classList.toggle('cover', on); $('#mc').classList.toggle('on', on); store.set('multiCover', on); };
   $('.mexit').onclick = () => go('cams');
+  $('#mw').onclick = () => {
+    const c = watchCfg();
+    setWatch({ level: c.level === 'off' ? c.last || 'agresif' : 'off' });
+    $('#mw').classList.toggle('on', watchCfg().level !== 'off');
+    toast(watchCfg().level === 'off' ? 'Deteksi gerak dimatikan' : `Deteksi gerak ${LEVELS[watchCfg().level].name} di semua layar`);
+  };
   document.querySelectorAll('.tile').forEach(t => {
     const d = devBySn(t.dataset.sn), dot = t.querySelector('.dot');
     const p = new LivePlayer(t.querySelector('video'), d, {
       stream: n === 1 ? '0' : '1',
       onState: s => { dot.className = 'dot ' + (s === 'play' || s === 'tick' ? 'online' : s === 'retry' ? 'offline' : 'sleeping'); },
     });
+    attachWatch(p, t.querySelector('.ov'), { onMotion: m => t.classList.toggle('motion', m) });
     p.start();
     t.onclick = () => go('live', d.sn);
   });
@@ -1066,12 +1242,14 @@ if (new URLSearchParams(location.search).has('demo')) {
       return url;
     },
     ptz: async () => {}, gotoPreset: async () => {},
+    sensitivity: async () => ({ on: true, level: 6, latch: 0, human: 2, box: true, track: 2, tracking: false, preset: 'agresif' }),
+    setSensitivity: async (d, k) => ({ on: true, level: SENS[k].level, latch: SENS[k].latch, human: SENS[k].human, box: SENS[k].box, track: SENS[k].track, tracking: false, preset: k }),
   });
 }
 
 // ---------- boot ----------
 
-window.__pantau = { S, api: () => api, LivePlayer, hevcMSE, ensureCloudKey, prefsSync, store };
+window.__pantau = { S, api: () => api, LivePlayer, players, hevcMSE, ensureCloudKey, prefsSync, store };
 if ('serviceWorker' in navigator) navigator.serviceWorker.getRegistrations?.().then(r => r.forEach(x => x.unregister())).catch(() => {});
 route();
 if (S.session && S.session.token !== 'demo') cloudReady();
