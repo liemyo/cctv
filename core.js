@@ -441,14 +441,63 @@ export class CloudStore {
     return out;
   }
 
+  // Web settings live as small JSON files in the owner's folder (bucket only takes jpg/mp4, so they are
+  // labelled image/jpeg). Each save is a new file named by its timestamp; the newest one wins.
+  async owner() { return this._owner ||= await sha256Hex(this.key); }
+
+  async getPrefs() {
+    const dir = `${await this.owner()}/web-prefs/`;
+    const r = await fetch(`${CLOUD.base}/storage/v1/object/list/${CLOUD.bucket}`, {
+      method: 'POST', headers: this.headers({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ prefix: dir, limit: 20, sortBy: { column: 'name', order: 'desc' } }),
+    });
+    if (!r.ok) throw new JFError(r.status, `Cloud ${r.status}`);
+    const names = (await r.json()).map(x => x.name).filter(n => /^\d+\.jpg$/.test(n)).sort((a, b) => parseInt(b) - parseInt(a));
+    if (!names.length) return null;
+    const g = await fetch(`${CLOUD.base}/storage/v1/object/authenticated/${CLOUD.bucket}/${dir}${names[0]}?t=${Date.now()}`, { headers: this.headers(), cache: 'no-store' });
+    if (!g.ok) throw new JFError(g.status, `Cloud ${g.status}`);
+    const j = await g.json();
+    j.old = names.slice(1).map(n => dir + n);
+    return j;
+  }
+
+  async putPrefs(prefs, { keepalive = false, old = [] } = {}) {
+    const dir = `${await this.owner()}/web-prefs/`;
+    const r = await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}/${dir}${prefs.t}.jpg`, {
+      method: 'POST', keepalive, body: JSON.stringify(prefs),
+      headers: this.headers({ 'Content-Type': 'image/jpeg', 'cache-control': 'max-age=0' }),
+    });
+    if (!r.ok && r.status !== 409) throw new JFError(r.status, `Cloud ${r.status}`);
+    if (old.length) await this.removePaths(old).catch(() => {});
+  }
+
+  async removePaths(prefixes) {
+    await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}`, {
+      method: 'DELETE', headers: this.headers({ 'Content-Type': 'application/json' }), body: JSON.stringify({ prefixes }),
+    });
+  }
+
+  /** Opens a cloud key sealed under one of the account's camera serial numbers (AES-GCM, PBKDF2 key). */
+  static async unseal(sealed, serials) {
+    const b = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+    for (const sn of serials) {
+      const id = (await sha256Hex('pantau-cam|' + sn)).slice(0, 12), it = sealed.find(x => x.id === id);
+      if (!it) continue;
+      try {
+        const base = await subtle.importKey('raw', enc.encode('pantau-cloud|' + sn), 'PBKDF2', false, ['deriveKey']);
+        const k = await subtle.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode('pantau-web-v1'), iterations: 250000 },
+          base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+        const key = new TextDecoder().decode(await subtle.decrypt({ name: 'AES-GCM', iv: b(it.iv) }, k, b(it.ct)));
+        if (CloudStore.isValidKey(key)) return key;
+      } catch {}
+    }
+    return null;
+  }
+
   async remove(ids) {
     const j = await this.rpc('pantau_del', { p_ids: ids });
     const paths = j.paths || [];
-    if (paths.length) {
-      await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}`, {
-        method: 'DELETE', headers: this.headers({ 'Content-Type': 'application/json' }), body: JSON.stringify({ prefixes: paths }),
-      });
-    }
+    if (paths.length) await this.removePaths(paths);
     return paths.length;
   }
 }

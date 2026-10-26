@@ -1,11 +1,14 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel } from './core.js?v=1';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel } from './core.js?v=2';
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// Settings in SYNC are also saved to the cloud (with the Klip Gerak key) so every browser gets them.
+const SYNC = ['theme', 'skin', 'glass', 'mode', 'quality', 'invert', 'panelOff', 'sideOff', 'multiN', 'multiCover', 'klipCam', 'pesanCam', 'pesanDays'];
 const store = {
   get(k, d = null) { try { const v = localStorage.getItem('pantau.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { v == null ? localStorage.removeItem('pantau.' + k) : localStorage.setItem('pantau.' + k, JSON.stringify(v)); } catch {} },
+  raw(k, v) { try { v == null ? localStorage.removeItem('pantau.' + k) : localStorage.setItem('pantau.' + k, JSON.stringify(v)); } catch {} },
+  set(k, v) { store.raw(k, v); if (SYNC.includes(k)) { store.raw('prefsT', Date.now()); prefsPush(); } },
 };
 
 const ICON = {
@@ -147,6 +150,71 @@ document.addEventListener('keydown', e => {
   if (e.key === '\\' && !e.metaKey && !e.ctrlKey && !e.target.closest('input, select, textarea')) toggleSide();
 });
 
+// ---------- cloud key + settings sync ----------
+
+// The Klip Gerak cloud key, sealed once per camera (AES-GCM, key = PBKDF2 of the camera serial number).
+// Only someone signed in to the iCSee account that owns these cameras can open it, so this public
+// source never contains the key itself. Re-seal with the Mac app's key when cameras change.
+const SEALED = [{"id":"10b25c7277b3","iv":"Dds0WFXClhGOZ/3W","ct":"Sr6jjuqUe/JUnku56No1Hue1uCBaGK/gMpKIe89MWlY+eWGVYIxyfUSjUkCIgmFOKuknzKfE9R8Z8jxwoj5xH2bPpB02WvlY8UYUL8paFuw="},{"id":"d6b0ade218b6","iv":"lTioKc6ZneNTCldA","ct":"qP5kpgrcv/t6FTVrjlQzfFTyaMWeH9/a5xoXEBOZ8ydXvm4SqO4NxGvTrcqbgUTM4J9gLQ3qNlM9PRPh3nyw7oyend9FKlEaho/bK6rqPb8="},{"id":"22beab695f8b","iv":"v4trtODFeiKBAalm","ct":"z12Dvzlz3qxvMMtgVwOjBuekljyyCw5P3SYOBoxoMULzDhTK4hF5V+lJMDKvxSdGA0xO5Y11HO/yHHsYztssSYRCuFwf6CmTQqL3Ew6O+Ng="},{"id":"82d59529dba9","iv":"X5tdCvvB4V5snDRh","ct":"qPlnSvz5vJiGOxba96TBWpwM7IUnhqmTHfmazEh2p+2WO+4udKB+/3PmKNtiDrDc05z3cQg0hhNQgiolx48UV+Yh0+SqrqdFSNpbxNU3PrA="}];
+
+let unsealing = null;
+async function ensureCloudKey() {
+  if (CloudStore.isValidKey(store.get('cloudKey', ''))) return true;
+  if (store.get('cloudOff', false) || !S.devices.length) return false;
+  unsealing ||= CloudStore.unseal(SEALED, S.devices.map(d => d.sn)).finally(() => { unsealing = null; });
+  const key = await unsealing;
+  if (key) store.raw('cloudKey', key);
+  return !!key;
+}
+
+const cloud = () => { const k = store.get('cloudKey', ''); return CloudStore.isValidKey(k) ? new CloudStore(k) : null; };
+const prefsNow = () => ({ t: store.get('prefsT', 0) || Date.now(), v: Object.fromEntries(SYNC.map(k => [k, store.get(k)]).filter(([, v]) => v != null)) });
+let prefsTimer = null, prefsOld = [], prefsState = '';
+
+function prefsPush(now = false) {
+  clearTimeout(prefsTimer);
+  prefsTimer = null;
+  const cs = cloud();
+  if (!cs) return;
+  const send = () => {
+    prefsTimer = null;
+    const p = prefsNow(), old = prefsOld; prefsOld = [];
+    cs.putPrefs(p, { keepalive: now, old }).then(() => { prefsState = 'ok'; store.raw('prefsSent', p.t); })
+      .catch(e => { prefsState = 'err'; prefsOld = old; console.warn('prefs', e); });
+  };
+  if (now) send(); else prefsTimer = setTimeout(send, 1200);
+}
+addEventListener('pagehide', () => { if (prefsTimer) prefsPush(true); });
+
+/** Pull the newest saved settings; apply them if they are newer than this browser's, else upload ours. */
+async function prefsSync() {
+  const cs = cloud();
+  if (!cs || prefsTimer) return;
+  let remote;
+  try { remote = await cs.getPrefs(); } catch (e) { prefsState = 'err'; console.warn('prefs', e); return; }
+  prefsState = 'ok';
+  prefsOld = remote?.old || [];
+  const localT = store.get('prefsT', 0);
+  if (remote?.t > localT && remote.v) {
+    const changed = SYNC.filter(k => JSON.stringify(store.get(k)) !== JSON.stringify(remote.v[k] ?? null));
+    for (const k of SYNC) store.raw(k, remote.v[k] ?? null);
+    store.raw('prefsT', remote.t); store.raw('prefsSent', remote.t);
+    if (changed.length) {
+      applyTheme();
+      $('.app')?.classList.toggle('side-off', !!store.get('sideOff', false));
+      if (S.view !== 'live' && S.view !== 'multi') route();
+    }
+  } else if (!remote ? SYNC.some(k => store.get(k) != null) : localT > remote.t) {
+    if (!localT) store.raw('prefsT', Date.now());
+    prefsPush(true);
+  }
+}
+
+async function cloudReady() {
+  if (await ensureCloudKey()) await prefsSync();
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.session) prefsSync(); });
+
 // ---------- login ----------
 
 function renderLogin() {
@@ -184,6 +252,7 @@ function renderLogin() {
       S.devices = await api.devices();
       store.set('devices', S.devices);
       go('cams');
+      cloudReady();
     } catch (e) {
       $('#lerr').textContent = e?.message || 'Gagal masuk';
     } finally { const b = $('#lbtn'); if (b) b.disabled = false; }
@@ -826,6 +895,12 @@ async function viewPesan() {
 
 async function viewKlip() {
   const main = $('#main');
+  if (!CloudStore.isValidKey(store.get('cloudKey', ''))) {
+    main.innerHTML = `${topbar('Klip Gerak')}<div class="empty glass">Membuka Klip Gerak…</div>`;
+    if (!S.devices.length) await refreshDevices();
+    if (await ensureCloudKey()) { prefsSync(); if (S.view === 'klip') route(); return; }
+    if (S.view !== 'klip') return;
+  }
   const key = store.get('cloudKey', '');
   if (!CloudStore.isValidKey(key)) {
     main.innerHTML = `
@@ -834,18 +909,20 @@ async function viewKlip() {
         <b>Hubungkan Klip Gerak</b>
         <div class="muted small">Klip video tiap gerakan direkam oleh aplikasi Pantau di Mac dan disimpan di cloud.
           Untuk melihatnya di sini, salin <b>kunci cloud</b> dari aplikasi Mac: <b>Saya › Cloud › tampilkan kunci</b> (64 huruf/angka),
-          lalu tempel di bawah. Kunci hanya disimpan di browser ini.</div>
+          lalu tempel di bawah. Kunci bawaan akun ini terbuka otomatis setelah masuk.</div>
         <input class="input" name="k" placeholder="kunci cloud 64 karakter" autocomplete="off" spellcheck="false">
         <div class="err" id="kerr"></div>
-        <div><button class="btn primary">Hubungkan</button></div>
+        <div class="row"><button class="btn primary">Hubungkan</button>
+          ${store.get('cloudOff', false) ? '<button class="btn" type="button" id="kauto">Pakai kunci bawaan</button>' : ''}</div>
       </form>`;
     $('#kf').onsubmit = async e => {
       e.preventDefault();
       const k = new FormData(e.target).get('k').trim().toLowerCase();
       if (!CloudStore.isValidKey(k)) { $('#kerr').textContent = 'Kunci harus 64 karakter hex (0-9, a-f).'; return; }
-      try { await new CloudStore(k).list({ limit: 1 }); store.set('cloudKey', k); route(); }
+      try { await new CloudStore(k).list({ limit: 1 }); store.set('cloudKey', k); store.raw('cloudOff', null); route(); prefsSync(); }
       catch (err) { $('#kerr').textContent = err.message; }
     };
+    $('#kauto') && ($('#kauto').onclick = () => { store.raw('cloudOff', null); route(); });
     return;
   }
   const cs = new CloudStore(key);
@@ -942,7 +1019,9 @@ function viewSaya() {
       <div class="glass">
         <h3>Klip Gerak (cloud)</h3>
         ${CloudStore.isValidKey(key) ? `<div class="row"><code class="k">${key.slice(0, 8)}••••••••${key.slice(-4)}</code><span class="spacer"></span>
-          <button class="btn danger" id="ck">Putuskan</button></div>` : '<div class="muted small">Belum terhubung — buka tab Klip Gerak.</div>'}
+          <button class="btn danger" id="ck">Putuskan</button></div>
+          <div class="muted small">Semua setelan di situs ini tersimpan otomatis ke cloud dan ikut di browser / perangkat lain${prefsState === 'err' ? ' — <b style="color:var(--warn)">gagal sinkron, dicoba lagi saat ada perubahan</b>' : ''}.</div>`
+          : '<div class="muted small">Belum terhubung — buka tab Klip Gerak.</div>'}
       </div>
       <div class="glass">
         <h3>Kunci platform</h3>
@@ -957,7 +1036,7 @@ function viewSaya() {
   $('#lo').onclick = () => { if (confirm('Keluar dari akun ini di browser ini?')) logout(false); };
   document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { store.set('theme', b.dataset.t); applyTheme(); route(); });
   document.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { store.set('mode', b.dataset.m); route(); });
-  $('#ck') && ($('#ck').onclick = () => { store.set('cloudKey', null); route(); });
+  $('#ck') && ($('#ck').onclick = () => { store.raw('cloudKey', null); store.raw('cloudOff', true); route(); });
 }
 
 // ---------- demo (?demo=1): sample data, never touches the saved session ----------
@@ -992,6 +1071,7 @@ if (new URLSearchParams(location.search).has('demo')) {
 
 // ---------- boot ----------
 
-window.__pantau = { S, api: () => api, LivePlayer, hevcMSE };
+window.__pantau = { S, api: () => api, LivePlayer, hevcMSE, ensureCloudKey, prefsSync, store };
 if ('serviceWorker' in navigator) navigator.serviceWorker.getRegistrations?.().then(r => r.forEach(x => x.unregister())).catch(() => {});
 route();
+if (S.session && S.session.token !== 'demo') cloudReady();
