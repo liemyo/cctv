@@ -31,6 +31,9 @@ const ICON = {
   light: '<path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9V16h7v-2.1A6 6 0 0 0 12 3z"/>',
   logout: '<path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10"/>',
   prev: '<path d="m15 5-7 7 7 7"/>', next: '<path d="m9 5 7 7-7 7"/>',
+  sidebar: '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/>',
+  sliders: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
+  move: '<path d="M12 3v18M3 12h18M12 3l-3 3M12 3l3 3M12 21l-3-3M12 21l3-3M3 12l3-3M3 12l3 3M21 12l-3-3M21 12l-3 3"/>',
 };
 const ic = (n, cls = '') => `<svg class="i ${cls}" viewBox="0 0 24 24">${ICON[n] || ''}</svg>`;
 
@@ -46,11 +49,29 @@ const S = {
 };
 let api = new JFClient(S.session?.keys || PUBLIC_KEYS, S.session?.token || null);
 
+// Liquid-glass skins: [blob1, blob2, blob3, accent, accent text] for light and dark.
+const SKINS = {
+  kaca: { name: 'Kaca', light: ['#8ec5ff', '#ffc6e0', '#b8f0d8', '#0a84ff'], dark: ['#1d4f91', '#5a1f4f', '#0f5a46', '#0a84ff'] },
+  aurora: { name: 'Aurora', light: ['#a7f3d0', '#c4b5fd', '#93c5fd', '#7c3aed'], dark: ['#065f46', '#4c1d95', '#1e3a8a', '#8b5cf6'] },
+  laut: { name: 'Laut', light: ['#7dd3fc', '#99f6e4', '#bfdbfe', '#0e7490'], dark: ['#0c4a6e', '#134e4a', '#1e3a8a', '#22d3ee', '#04222b'] },
+  senja: { name: 'Senja', light: ['#fdba74', '#f9a8d4', '#fde68a', '#c2410c'], dark: ['#7c2d12', '#831843', '#713f12', '#fb923c', '#2a1204'] },
+  hutan: { name: 'Hutan', light: ['#bbf7d0', '#d9f99d', '#a7f3d0', '#15803d'], dark: ['#14532d', '#365314', '#064e3b', '#22c55e', '#04210f'] },
+  mono: { name: 'Mono', light: ['#e5e7eb', '#cbd5e1', '#f8fafc', '#111827'], dark: ['#3f3f46', '#27272a', '#52525b', '#e5e7eb', '#111111'] },
+};
+const BLUR = { halus: '14px', sedang: '26px', kuat: '42px' };
+const darkMQ = matchMedia('(prefers-color-scheme: dark)');
+
 function applyTheme() {
-  const t = store.get('theme', 'auto');
-  if (t === 'auto') document.documentElement.removeAttribute('data-theme');
-  else document.documentElement.setAttribute('data-theme', t);
+  const t = store.get('theme', 'auto'), skin = SKINS[store.get('skin', 'kaca')] || SKINS.kaca;
+  const dark = t === 'dark' || (t === 'auto' && darkMQ.matches);
+  const r = document.documentElement;
+  r.dataset.theme = dark ? 'dark' : 'light';
+  const [b1, b2, b3, acc, accInk = '#fff'] = skin[dark ? 'dark' : 'light'];
+  for (const [k, v] of Object.entries({ '--blob1': b1, '--blob2': b2, '--blob3': b3, '--accent': acc, '--accent-ink': accInk, '--blur': BLUR[store.get('glass', 'sedang')] || BLUR.sedang }))
+    r.style.setProperty(k, v);
+  $('meta[name="theme-color"]')?.setAttribute('content', dark ? '#0b1018' : '#e9eef5');
 }
+darkMQ.addEventListener?.('change', applyTheme);
 applyTheme();
 
 let toastTimer;
@@ -84,6 +105,7 @@ function go(view, sn) {
 function route() {
   const [view, sn] = location.hash.slice(1).split('/');
   stopAllPlayers();
+  clearInterval(S.tick);
   if (!S.session) { renderLogin(); return; }
   S.view = VIEWS.some(v => v[0] === view) || view === 'live' ? view : 'cams';
   S.liveSn = sn || null;
@@ -92,12 +114,13 @@ function route() {
 window.addEventListener('hashchange', route);
 
 function renderShell() {
+  document.body.dataset.view = S.view;
   const nav = cls => VIEWS.map(([k, label, icon]) =>
     `<button class="nav ${S.view === k || (S.view === 'live' && k === 'cams') ? 'active' : ''}" data-go="${k}">${ic(icon)}<span>${label}</span></button>`).join('');
   $('#root').innerHTML = `
-    <div class="app">
+    <div class="app ${store.get('sideOff', false) ? 'side-off' : ''}">
       <aside class="side"><div class="glass">
-        <div class="brand"><img src="icon-192.png" alt="">Pantau</div>
+        <div class="brand"><img src="icon-192.png" alt="">Pantau<button class="btn icon" data-side title="Sembunyikan menu ( \\ )">${ic('sidebar')}</button></div>
         ${nav()}
         <div class="foot">${esc(S.session.account)}</div>
       </div></aside>
@@ -107,6 +130,22 @@ function renderShell() {
   document.querySelectorAll('[data-go]').forEach(b => b.onclick = () => go(b.dataset.go));
   ({ cams: viewCams, live: viewLive, multi: viewMulti, pesan: viewPesan, klip: viewKlip, saya: viewSaya })[S.view]();
 }
+
+/** Page header. The sidebar button only shows while the sidebar is hidden (desktop). */
+const topbar = (title, right = '', left = '') =>
+  `<div class="top"><button class="btn icon sbt" data-side title="Tampilkan menu ( \\ )">${ic('sidebar')}</button>${left}<h1>${title}</h1><span class="spacer"></span>${right}</div>`;
+
+function toggleSide() {
+  const app = $('.app');
+  if (!app) return;
+  const off = !app.classList.contains('side-off');
+  app.classList.toggle('side-off', off);
+  store.set('sideOff', off);
+}
+document.addEventListener('click', e => { if (e.target.closest('[data-side]')) toggleSide(); });
+document.addEventListener('keydown', e => {
+  if (e.key === '\\' && !e.metaKey && !e.ctrlKey && !e.target.closest('input, select, textarea')) toggleSide();
+});
 
 // ---------- login ----------
 
@@ -184,19 +223,14 @@ async function viewCams() {
   const main = $('#main');
   const draw = () => {
     main.innerHTML = `
-      <div class="top"><h1>Kamera</h1><span class="spacer"></span>
-        <button class="btn" id="rf">${ic('refresh')}<span>Segarkan</span></button></div>
+      ${topbar('Kamera', `<button class="btn lbl" id="rf" title="Segarkan">${ic('refresh')}<span>Segarkan</span></button>`)}
       ${S.devices.length ? `<div class="grid">${S.devices.map(camCard).join('')}</div>` : '<div class="empty glass">Memuat kamera…</div>'}`;
     main.querySelectorAll('.cam').forEach(c => c.onclick = () => go('live', c.dataset.sn));
     $('#rf').onclick = () => { S.thumbs = {}; load(true); };
   };
-  const load = async (thumbs) => {
-    draw();
-    await refreshDevices();
-    if (S.view !== 'cams') return;
-    draw();
+  const snap = all => {
     for (const d of S.devices) {
-      if (!thumbs && S.thumbs[d.sn]) continue;
+      if (!all && S.thumbs[d.sn]) continue;
       if (S.status[d.sn] && S.status[d.sn] !== 'online') continue;
       api.capture(d).then(blob => blobToDataURL(blob)).then(url => {
         S.thumbs[d.sn] = url; store.set('thumbs', S.thumbs);
@@ -204,7 +238,16 @@ async function viewCams() {
       }).catch(() => {});
     }
   };
+  const load = async (thumbs) => {
+    draw();
+    await refreshDevices();
+    if (S.view !== 'cams') return;
+    draw();
+    snap(thumbs);
+  };
   load(false);
+  // keep the preview pictures fresh while this page is open
+  S.tick = setInterval(() => { if (!document.hidden && S.view === 'cams') snap(true); }, 45000);
 }
 
 const blobToDataURL = blob => new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = bad; r.readAsDataURL(blob); });
@@ -220,16 +263,34 @@ function hevcMSE() {
   return ['hvc1.1.6.L120.90', 'hev1.1.6.L120.90', 'hvc1.1.6.L93.B0'].some(c => MS.isTypeSupported(`video/mp4; codecs="${c}"`));
 }
 
-/** Live view for one camera. FLV (native H.265, ~2 s behind) when the browser can decode HEVC, else relay HLS (H.264, 7–9 s). */
+// Safari and every iPhone/iPad browser (CriOS, FxiOS, EdgiOS carry no "Chrome/" token) run on WebKit.
+const isWebKit = /AppleWebKit/.test(navigator.userAgent) && !/Chrome\/|Chromium\/|Edg\/|Android/.test(navigator.userAgent);
+
+/** auto: FLV where it plays smoothly; WebKit decodes the cameras' H.265 FLV for a few seconds and then
+ *  freezes on the last frame (measured), so it gets the H.264 HLS relay instead. */
+function liveMode() {
+  const m = store.get('mode', 'auto');
+  if (m === 'hls' || !hevcMSE() || !window.mpegts) return 'hls';
+  if (m === 'flv') return 'flv';
+  return isWebKit || S.flvFrozen ? 'hls' : 'flv';
+}
+
+/** Live view for one camera. FLV (native H.265, ~1–2 s behind) when the browser plays it well, else relay HLS (H.264, 3–8 s). */
 class LivePlayer {
   constructor(video, dev, { stream = '1', muted = true, onState = () => {} } = {}) {
     this.video = video; this.dev = dev; this.stream = stream; this.muted = muted; this.onState = onState;
-    this.fails = 0; this.mode = store.get('mode', 'auto') === 'hls' || !hevcMSE() || !window.mpegts ? 'hls' : 'flv';
+    this.fails = 0; this.mode = liveMode();
     video.muted = muted; video.playsInline = true; video.crossOrigin = 'anonymous';
     this.onReady = () => this.kick();
     video.addEventListener('loadeddata', this.onReady);
     video.addEventListener('canplay', this.onReady);
     players.add(this);
+  }
+
+  /** Frames the decoder has produced. currentTime keeps moving on a frozen picture (and jumps on seeks); this doesn't. */
+  frameCount() {
+    const v = this.video, q = v.getVideoPlaybackQuality?.();
+    return q ? q.totalVideoFrames : v.webkitDecodedFrameCount ?? null;
   }
 
   /** Starts / resumes playback. Safari rejects play() issued before the stream has data (and never retries it),
@@ -242,10 +303,11 @@ class LivePlayer {
     });
   }
 
-  /** Jump to the live edge when playback has fallen behind (tab in background, slow decode, stalls). */
+  /** Jump to the live edge when playback has fallen behind (tab in background, slow decode, stalls).
+   *  Never while paused: WebKit drops back to HAVE_METADATA on every seek and then never starts playing. */
   toEdge() {
     const v = this.video;
-    if (!v.buffered.length) return;
+    if (v.paused || v.seeking || !v.buffered.length) return;
     const end = v.buffered.end(v.buffered.length - 1);
     const max = this.mode === 'flv' ? 1.5 : 5, keep = this.mode === 'flv' ? 0.3 : 1.5;
     if (end - v.currentTime > max) v.currentTime = end - keep;
@@ -267,6 +329,7 @@ class LivePlayer {
     } catch (e) {
       if (gen !== this.gen || this.stopped) return;
       if ([4100, 4101, 4118].includes(e?.code)) return handleErr(e);
+      this.fails++;
       this.retry(e?.message || 'Gagal menyambung');
     }
   }
@@ -293,18 +356,22 @@ class LivePlayer {
     }
   }
 
-  /** Watchdog: no picture within 14 s, or picture frozen 10 s → reconnect; FLV falls back to HLS after 2 failures. */
+  /** Watchdog: no picture within 14 s, or no new frame for 6 s (FLV) / 10 s (HLS) → reconnect.
+   *  A frozen FLV picture in auto mode switches to HLS at once (and for the rest of the visit). */
   watch(gen) {
-    let last = -1, still = 0, started = false;
+    let lastF = -1, lastT = -1, still = 0, started = false;
     clearInterval(this.timer);
     this.timer = setInterval(() => {
       if (gen !== this.gen) return;
       const v = this.video;
+      if (document.hidden) { still = 0; return; }
       if (v.paused && v.readyState >= 2) this.kick();
       this.toEdge();
-      const t = v.currentTime;
-      if (t > 0 && t !== last) {
-        still = 0; last = t;
+      const f = this.frameCount(), t = v.currentTime;
+      const moving = !v.paused && (f != null ? f > 0 && f !== lastF : t > 0 && t !== lastT);
+      lastF = f; lastT = t;
+      if (moving) {
+        still = 0;
         if (!started) { started = true; this.fails = 0; this.onState('play'); }
         // latency readout (seconds of buffered video not yet shown)
         const b = v.buffered.length ? v.buffered.end(v.buffered.length - 1) - t : 0;
@@ -314,14 +381,21 @@ class LivePlayer {
         this.onState('blocked');
       } else {
         still += 1;
-        if (still >= (started ? 10 : 14)) { this.fails++; this.retry(started ? 'Gambar berhenti — menyambung ulang…' : 'Kamera tidak mengirim gambar'); }
+        if (still < (!started ? 14 : this.mode === 'flv' ? 6 : 10)) return;
+        if (started && this.mode === 'flv' && store.get('mode', 'auto') === 'auto') {
+          S.flvFrozen = true; this.fails = 2;
+          this.retry('Gambar macet');
+        } else {
+          this.fails++;
+          this.retry(started ? 'Gambar berhenti — menyambung ulang…' : 'Kamera tidak mengirim gambar');
+        }
       }
     }, 1000);
   }
 
   retry(why) {
     if (this.stopped) return;
-    if (this.mode === 'flv' && this.fails >= 2) { this.mode = 'hls'; this.fails = 0; why += ' — beralih ke mode stabil'; }
+    if (this.mode === 'flv' && this.fails >= 2 && store.get('mode', 'auto') !== 'flv') { this.mode = 'hls'; this.fails = 0; why += ' — beralih ke mode stabil'; }
     this.onState('retry', why);
     this.teardown();
     clearTimeout(this.rt);
@@ -362,7 +436,15 @@ function autoplayHint() {
   document.body.append(el);
 }
 document.addEventListener('pointerdown', () => players.forEach(p => p.blocked && p.kick()), true);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) players.forEach(p => { p.toEdge(); p.kick(); }); });
+// Phones suspend the page (and drop the stream) in the background: after a longer absence reconnect instead of resuming a dead stream.
+let hiddenAt = 0;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { hiddenAt = Date.now(); return; }
+  const away = hiddenAt && Date.now() - hiddenAt > 8000;
+  players.forEach(p => { if (away) p.start(); else { p.toEdge(); p.kick(); } });
+});
+window.addEventListener('pageshow', e => { if (e.persisted) players.forEach(p => p.start()); });
+window.addEventListener('online', () => players.forEach(p => p.start()));
 
 // ---------- live view ----------
 
@@ -383,45 +465,57 @@ function viewLive() {
   const others = S.devices.filter(x => x.sn !== d.sn);
   const quality = store.get('quality', 'auto');
   const inv = store.get('invert', {})[d.sn] ?? 1;
+  const pad = `<div class="pad">
+      <span></span><button class="btn" data-dir="DirectionUp">${ic('up')}</button><span></span>
+      <button class="btn" data-dir="DirectionLeft">${ic('left')}</button><span class="c">tahan</span><button class="btn" data-dir="DirectionRight">${ic('right')}</button>
+      <button class="btn" data-dir="ZoomWide" title="Perkecil">${ic('minus')}</button><button class="btn" data-dir="DirectionDown">${ic('down')}</button><button class="btn" data-dir="ZoomTile" title="Perbesar">${ic('plus')}</button>
+    </div>`;
   $('#main').innerHTML = `
-    <div class="top"><button class="btn icon" id="bk" title="Kembali">${ic('back')}</button><h1>${esc(d.name)}</h1></div>
-    <div class="live">
-      <div>
-        <div class="stage" id="stage">
-          <video id="vid" playsinline muted autoplay></video>
-          <div class="tl"><span class="badge" id="lb" style="position:static"><i class="dot"></i><span>…</span></span></div>
-          <div class="msg" id="msg"><div><div class="spin"></div><div id="msgt">Menyambung…</div></div></div>
-          <div class="hud">
-            <button class="btn icon" id="snd" title="Suara">${ic('mute')}</button>
-            <select id="q" title="Kualitas">
-              <option value="auto">Auto</option><option value="0">Full HD</option><option value="1">SD</option>
-            </select>
-            <span class="spacer"></span>
-            <button class="btn icon" id="shot" title="Foto">${ic('shot')}</button>
-            <button class="btn icon" id="rec" title="Rekam">${ic('rec')}</button>
-            <button class="btn icon" id="fill" title="Isi layar">${ic('grid')}</button>
-            <button class="btn icon" id="fs" title="Layar penuh">${ic('full')}</button>
-          </div>
+    ${topbar(esc(d.name), `
+      ${others.length ? `<div class="scroller">${others.map(o => `<button class="chip" data-sn="${esc(o.sn)}">${ic('cam')}${esc(o.name)}</button>`).join('')}</div>` : ''}
+      <button class="btn icon ${store.get('panelOff', false) ? '' : 'on'}" id="pt" title="Panel kontrol">${ic('sliders')}</button>`,
+      `<button class="btn icon" id="bk" title="Kembali">${ic('back')}</button>`)}
+    <div class="live ${store.get('panelOff', false) ? 'nopanel' : ''}" id="live">
+      <div class="stage" id="stage">
+        <video id="vid" playsinline muted autoplay></video>
+        <div class="tl"><button class="btn icon lback" id="bk2" title="Kembali">${ic('back')}</button>
+          <span class="badge" id="lb"><i class="dot"></i><span>…</span></span></div>
+        <div class="msg" id="msg"><div><div class="spin"></div><div id="msgt">Menyambung…</div></div></div>
+        <div class="opad">${pad}</div>
+        <div class="hud">
+          <button class="btn icon" id="snd" title="Suara">${ic('mute')}</button>
+          <select id="q" title="Kualitas">
+            <option value="auto">Auto</option><option value="0">HD</option><option value="1">SD</option>
+          </select>
+          <span class="spacer"></span>
+          <button class="btn icon ptzb" id="ptzb" title="Gerak kamera">${ic('move')}</button>
+          <button class="btn icon" id="shot" title="Foto">${ic('shot')}</button>
+          <button class="btn icon" id="rec" title="Rekam">${ic('rec')}</button>
+          <button class="btn icon" id="fill" title="Isi layar">${ic('grid')}</button>
+          <button class="btn icon" id="fs" title="Layar penuh">${ic('full')}</button>
         </div>
-        ${others.length ? `<div class="chips" style="margin-top:12px">${others.map(o => `<button class="chip" data-sn="${esc(o.sn)}">${ic('cam')}${esc(o.name)}</button>`).join('')}</div>` : ''}
       </div>
       <div class="glass panel">
-        <h3>Gerak kamera</h3>
-        <div class="pad" id="pad">
-          <span></span><button class="btn" data-dir="DirectionUp">${ic('up')}</button><span></span>
-          <button class="btn" data-dir="DirectionLeft">${ic('left')}</button><span class="c">tahan</span><button class="btn" data-dir="DirectionRight">${ic('right')}</button>
-          <button class="btn" data-dir="ZoomWide" title="Perkecil">${ic('minus')}</button><button class="btn" data-dir="DirectionDown">${ic('down')}</button><button class="btn" data-dir="ZoomTile" title="Perbesar">${ic('plus')}</button>
-        </div>
-        <select class="input" id="inv">${Object.entries(INVERT).map(([k, v]) => `<option value="${k}" ${+k === inv ? 'selected' : ''}>${v}</option>`).join('')}</select>
-        <div class="row"><h3>Favorit</h3><span class="spacer"></span><button class="btn" id="addp">${ic('star')}<span>Simpan posisi</span></button></div>
-        <div id="presets" class="muted small">Memuat…</div>
-        <h3>Lampu malam</h3>
-        <select class="input" id="light" disabled><option>Memuat…</option></select>
+        <h3 class="pt-title">Gerak kamera</h3>
+        <div class="ptz">${pad}</div>
+        <label class="field"><span>Arah kontrol</span>
+          <select class="input" id="inv">${Object.entries(INVERT).map(([k, v]) => `<option value="${k}" ${+k === inv ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+        <label class="field"><span>Lampu malam</span>
+          <select class="input" id="light" disabled><option>Memuat…</option></select></label>
+        <details id="favd" ${innerWidth > 820 ? 'open' : ''}><summary>Posisi favorit</summary>
+          <div style="display:grid;gap:6px">
+            <button class="btn" id="addp">${ic('star')}<span>Simpan posisi ini</span></button>
+            <div id="presets" class="muted small">Memuat…</div>
+          </div></details>
         <div class="muted small" id="info"></div>
       </div>
     </div>`;
-  $('#bk').onclick = () => go('cams');
-  document.querySelectorAll('.chips .chip').forEach(c => c.onclick = () => go('live', c.dataset.sn));
+  $('#bk').onclick = $('#bk2').onclick = () => go('cams');
+  document.querySelectorAll('.top .chip').forEach(c => c.onclick = () => go('live', c.dataset.sn));
+  $('#pt').onclick = () => {
+    const off = !$('#live').classList.contains('nopanel');
+    $('#live').classList.toggle('nopanel', off); $('#pt').classList.toggle('on', !off); store.set('panelOff', off);
+  };
 
   const video = $('#vid'), stage = $('#stage');
   const setMsg = (text, spin = true) => {
@@ -448,7 +542,7 @@ function viewLive() {
     });
     player.start();
   };
-  const q0 = quality === 'auto' ? (innerWidth < 600 ? '1' : '0') : quality;
+  const q0 = quality === 'auto' ? (Math.min(innerWidth, innerHeight) < 600 ? '1' : '0') : quality;
   $('#q').value = quality;
   startPlayer(q0);
   // Auto: drop to SD when the picture keeps stalling in Full HD.
@@ -468,11 +562,14 @@ function viewLive() {
     $('#snd').classList.toggle('on', !player.muted);
   };
   $('#fill').onclick = () => { stage.classList.toggle('fill'); $('#fill').classList.toggle('on'); };
+  $('#ptzb').onclick = () => { stage.classList.toggle('ptz'); $('#ptzb').classList.toggle('on'); };
   $('#fs').onclick = () => {
     if (document.fullscreenElement) document.exitFullscreen();
-    else if (stage.requestFullscreen) stage.requestFullscreen().catch(() => video.webkitEnterFullscreen?.());
+    else if (stage.requestFullscreen) stage.requestFullscreen().then(() => screen.orientation?.lock?.('landscape').catch(() => {})).catch(() => video.webkitEnterFullscreen?.());
     else video.webkitEnterFullscreen?.();
   };
+  // tap the picture to hide / show the controls
+  stage.addEventListener('click', e => { if (!e.target.closest('button, select, .opad')) stage.classList.toggle('hud-off'); });
   $('#shot').onclick = async () => {
     const name = `${d.name} ${fileStamp()}.jpg`;
     if (video.videoWidth) {
@@ -504,7 +601,7 @@ function viewLive() {
   // PTZ: hold to move
   let invert = inv;
   $('#inv').onchange = e => { invert = +e.target.value; const m = store.get('invert', {}); m[d.sn] = invert; store.set('invert', m); };
-  $('#pad').querySelectorAll('[data-dir]').forEach(b => {
+  document.querySelectorAll('.pad [data-dir]').forEach(b => {
     let active = null;
     const down = ev => {
       ev.preventDefault(); b.setPointerCapture?.(ev.pointerId);
@@ -589,16 +686,21 @@ async function saveURL(url, name) {
 // ---------- multi view ----------
 
 function viewMulti() {
-  const n = store.get('multiN', 2);
+  const n = store.get('multiN', 2), cover = store.get('multiCover', false);
   const cams = S.devices.slice(0, n * n);
+  // fill the screen: columns/rows from the cameras actually shown, phones in portrait scroll 1–2 columns
+  const cols = n === 1 ? 1 : Math.min(n, Math.ceil(Math.sqrt(cams.length))), rows = Math.ceil(cams.length / cols) || 1;
   $('#main').innerHTML = `
-    <div class="top"><h1>Multi Layar</h1><span class="spacer"></span>
-      <div class="seg">${[1, 2, 3].map(k => `<button data-n="${k}" class="${k === n ? 'on' : ''}">${k === 1 ? '1' : `${k}×${k}`}</button>`).join('')}</div></div>
-    <div class="multi n${n}">${cams.map(d => `
+    ${topbar('Multi Layar', `
+      <button class="btn icon ${cover ? 'on' : ''}" id="mc" title="Isi penuh (potong tepi)">${ic('full')}</button>
+      <div class="seg">${[1, 2, 3].map(k => `<button data-n="${k}" class="${k === n ? 'on' : ''}">${k === 1 ? '1' : `${k}×${k}`}</button>`).join('')}</div>`)}
+    <div class="multi ${cover ? 'cover' : ''}" style="--mcols:repeat(${cols},minmax(0,1fr));--mrows:repeat(${rows},minmax(0,1fr));--pcols:repeat(${n === 1 ? 1 : 2},minmax(0,1fr))">${cams.map(d => `
       <div class="tile" data-sn="${esc(d.sn)}"><video playsinline muted autoplay></video>
         <span class="badge"><i class="dot"></i>${esc(d.name)}</span></div>`).join('')}</div>
-    <p class="muted small">Semua layar memakai kualitas SD tanpa suara. Klik satu layar untuk membuka live penuh.</p>`;
+    <button class="btn icon mexit" data-go="cams" title="Tutup">${ic('x')}</button>`;
   document.querySelectorAll('.seg [data-n]').forEach(b => b.onclick = () => { store.set('multiN', +b.dataset.n); route(); });
+  $('#mc').onclick = () => { const on = !$('.multi').classList.contains('cover'); $('.multi').classList.toggle('cover', on); $('#mc').classList.toggle('on', on); store.set('multiCover', on); };
+  $('.mexit').onclick = () => go('cams');
   document.querySelectorAll('.tile').forEach(t => {
     const d = devBySn(t.dataset.sn), dot = t.querySelector('.dot');
     const p = new LivePlayer(t.querySelector('video'), d, {
@@ -700,11 +802,10 @@ async function viewPesan() {
     draw(); loadPics();
   };
   main.innerHTML = `
-    <div class="top"><h1>Pesan</h1><span class="spacer"></span><button class="btn icon" id="rf">${ic('refresh')}</button></div>
+    ${topbar('Pesan', `<div class="seg" id="df">${[[1, '24 jam'], [3, '3 hari'], [7, '7 hari']].map(([k, v]) => `<button data-d="${k}" class="${k === days ? 'on' : ''}">${v}</button>`).join('')}</div>
+      <button class="btn icon" id="rf" title="Segarkan">${ic('refresh')}</button>`)}
     <div class="toolbar">
       <div class="chips" id="cf">${[['all', 'Semua'], ...S.devices.map(d => [d.sn, d.name])].map(([k, v]) => `<button class="chip ${filter === k ? 'on' : ''}" data-f="${esc(k)}">${esc(v)}</button>`).join('')}</div>
-      <span class="spacer"></span>
-      <div class="seg" id="df">${[[1, '24 jam'], [3, '3 hari'], [7, '7 hari']].map(([k, v]) => `<button data-d="${k}" class="${k === days ? 'on' : ''}">${v}</button>`).join('')}</div>
     </div>
     <div id="out"></div>`;
   main.querySelectorAll('[data-f]').forEach(b => b.onclick = () => {
@@ -728,7 +829,7 @@ async function viewKlip() {
   const key = store.get('cloudKey', '');
   if (!CloudStore.isValidKey(key)) {
     main.innerHTML = `
-      <div class="top"><h1>Klip Gerak</h1></div>
+      ${topbar('Klip Gerak')}
       <form class="glass" id="kf" style="padding:20px;display:grid;gap:12px;max-width:620px">
         <b>Hubungkan Klip Gerak</b>
         <div class="muted small">Klip video tiap gerakan direkam oleh aplikasi Pantau di Mac dan disimpan di cloud.
@@ -791,7 +892,7 @@ async function viewKlip() {
     } catch (e) { $('#out').innerHTML = `<div class="empty glass">${esc(e.message)}</div>`; }
   };
   main.innerHTML = `
-    <div class="top"><h1>Klip Gerak</h1><span class="spacer"></span><button class="btn icon" id="rf">${ic('refresh')}</button></div>
+    ${topbar('Klip Gerak', `<button class="btn icon" id="rf" title="Segarkan">${ic('refresh')}</button>`)}
     <div class="toolbar">
       <div class="chips">${[['all', 'Semua'], ...S.devices.map(d => [d.sn, d.name])].map(([k, v]) => `<button class="chip ${filter === k ? 'on' : ''}" data-f="${esc(k)}">${esc(v)}</button>`).join('')}</div>
       <span class="spacer"></span><span class="muted small" id="usage"></span>
@@ -809,10 +910,14 @@ async function viewKlip() {
 // ---------- settings ----------
 
 function viewSaya() {
-  const theme = store.get('theme', 'auto'), mode = store.get('mode', 'auto'), key = store.get('cloudKey', '');
-  const keys = S.session.keys;
+  const theme = store.get('theme', 'auto'), skin = store.get('skin', 'kaca'), glass = store.get('glass', 'sedang');
+  const mode = store.get('mode', 'auto'), key = store.get('cloudKey', '');
+  const keys = S.session.keys, dark = document.documentElement.dataset.theme === 'dark';
+  const swatch = c => `radial-gradient(70% 90% at 15% 25%, ${c[0]}, transparent 70%), radial-gradient(60% 90% at 85% 15%, ${c[1]}, transparent 70%),
+    radial-gradient(70% 90% at 60% 110%, ${c[2]}, transparent 70%), linear-gradient(${c[3]}22, ${c[3]}22), ${dark ? '#0b1018' : '#eef2f7'}`;
+  const auto = mode === 'auto' ? (liveMode() === 'flv' ? 'sekarang: Cepat' : 'sekarang: Stabil') : '';
   $('#main').innerHTML = `
-    <div class="top"><h1>Saya</h1></div>
+    ${topbar('Saya')}
     <div class="settings">
       <div class="glass">
         <h3>Akun</h3>
@@ -820,15 +925,19 @@ function viewSaya() {
           <span class="spacer"></span><button class="btn danger" id="lo">${ic('logout')}<span>Keluar</span></button></div>
       </div>
       <div class="glass">
-        <h3>Tampilan</h3>
+        <h3>Tema Liquid Glass</h3>
         <div class="seg" id="th">${[['auto', 'Otomatis'], ['light', 'Terang'], ['dark', 'Gelap']].map(([k, v]) => `<button data-t="${k}" class="${k === theme ? 'on' : ''}">${v}</button>`).join('')}</div>
+        <div class="skins">${Object.entries(SKINS).map(([k, s]) => `<button class="skin ${k === skin ? 'on' : ''}" data-skin="${k}">
+          <i style="background:${swatch(s[dark ? 'dark' : 'light'])}"></i><span>${s.name}</span></button>`).join('')}</div>
+        <div class="row"><span class="small muted">Efek kaca</span>
+          <div class="seg" id="gl">${[['halus', 'Halus'], ['sedang', 'Sedang'], ['kuat', 'Kuat']].map(([k, v]) => `<button data-g="${k}" class="${k === glass ? 'on' : ''}">${v}</button>`).join('')}</div></div>
       </div>
       <div class="glass">
         <h3>Mode live</h3>
-        <div class="seg" id="md">${[['auto', 'Cepat (± 2 dtk)'], ['hls', 'Stabil (± 8 dtk)']].map(([k, v]) => `<button data-m="${k}" class="${k === mode ? 'on' : ''}">${v}</button>`).join('')}</div>
-        <div class="muted small">Cepat = video H.265 asli kamera, butuh browser yang bisa memutar HEVC
-          (${hevcMSE() ? '<b style="color:var(--ok)">browser ini bisa</b>' : '<b style="color:var(--warn)">browser ini tidak bisa — otomatis memakai mode Stabil</b>'}).
-          Stabil = diubah ke H.264 oleh server iCSee, jalan di semua browser tetapi tertinggal beberapa detik.</div>
+        <div class="seg" id="md">${[['auto', 'Otomatis'], ['flv', 'Cepat ± 2 dtk'], ['hls', 'Stabil ± 5 dtk']].map(([k, v]) => `<button data-m="${k}" class="${k === mode ? 'on' : ''}">${v}</button>`).join('')}</div>
+        <div class="muted small">${auto ? `<b>${auto}.</b> ` : ''}Cepat = video H.265 asli kamera (Chrome / Edge di komputer & Android${hevcMSE() ? '' : '; <b style="color:var(--warn)">browser ini tidak bisa</b>'}).
+          Stabil = diubah ke H.264 oleh server iCSee, lancar di semua browser termasuk iPhone/iPad & Safari, tertinggal beberapa detik.
+          ${isWebKit ? '<br>Browser ini memakai mesin Safari: mode Cepat sering macet di sini, jadi Otomatis memakai Stabil.' : ''}</div>
       </div>
       <div class="glass">
         <h3>Klip Gerak (cloud)</h3>
@@ -841,8 +950,10 @@ function viewSaya() {
           ${keys.appKey === PUBLIC_KEYS.appKey ? 'kunci demo publik JFTech' : 'kunci sendiri'} — ubah saat masuk (Kunci platform).</div>
       </div>
       <div class="muted small">Pantau web · terhubung langsung ke cloud iCSee (rs.xmeye.net · api.jftechws.com). Tidak ada server perantara.
-        Bicara/interkom & perekam latar belakang hanya ada di aplikasi Mac.</div>
+        Bicara/interkom & perekam latar belakang hanya ada di aplikasi Mac. Tekan <b>\\</b> untuk menyembunyikan / membuka menu samping.</div>
     </div>`;
+  document.querySelectorAll('[data-skin]').forEach(b => b.onclick = () => { store.set('skin', b.dataset.skin); applyTheme(); route(); });
+  document.querySelectorAll('[data-g]').forEach(b => b.onclick = () => { store.set('glass', b.dataset.g); applyTheme(); route(); });
   $('#lo').onclick = () => { if (confirm('Keluar dari akun ini di browser ini?')) logout(false); };
   document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { store.set('theme', b.dataset.t); applyTheme(); route(); });
   document.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { store.set('mode', b.dataset.m); route(); });
