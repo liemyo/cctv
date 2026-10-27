@@ -1,10 +1,11 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=3';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=4';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=5';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtBytes = b => b >= 1073741824 ? `${(b / 1073741824).toFixed(1).replace('.', ',')} GB` : `${(b / 1048576).toFixed(0)} MB`;
 // Settings in SYNC are also saved to the cloud (with the Klip Gerak key) so every browser gets them.
 const SYNC = ['theme', 'skin', 'glass', 'mode', 'quality', 'invert', 'panelOff', 'sideOff', 'multiN', 'multiCover', 'klipCam', 'pesanCam', 'pesanDays', 'watch'];
 const store = {
@@ -1259,7 +1260,7 @@ async function viewKlip() {
     return;
   }
   const cs = new CloudStore(key);
-  let rows = [], used = 0, count = 0, thumbs = {}, filter = store.get('klipCam', 'all');
+  let rows = [], used = 0, quota = 0, count = 0, thumbs = {}, filter = store.get('klipCam', 'all');
   const draw = () => {
     const list = rows.filter(r => filter === 'all' || r.sn === filter);
     let html = '', lastDay = '';
@@ -1274,7 +1275,7 @@ async function viewKlip() {
     if (lastDay) html += '</div>';
     $('#out').innerHTML = list.length ? html + (rows.length < count ? '<div class="row" style="justify-content:center;margin-top:16px"><button class="btn" id="more">Muat lagi</button></div>' : '')
       : '<div class="empty glass">Belum ada klip.</div>';
-    $('#usage').textContent = `${count} kejadian · ${(used / 1048576).toFixed(0)} MB dari 700 MB`;
+    $('#usage').textContent = `${count} kejadian · ${fmtBytes(used)} dari ${fmtBytes(quota)}`;
     main.querySelectorAll('.ev').forEach(b => b.onclick = () => {
       const items = list.map(r => ({
         video: !!r.video, poster: thumbs[r.alarm_photo || r.photo],
@@ -1294,7 +1295,7 @@ async function viewKlip() {
     try {
       const page = await cs.list({ before, limit: 120 });
       rows = before ? rows.concat(page.rows) : page.rows;
-      used = page.used; count = page.count;
+      if (!before) { used = page.used; quota = page.quota; } count = page.count;
       const paths = [...new Set(page.rows.map(r => r.alarm_photo || r.photo).filter(Boolean))];
       draw();
       for (let i = 0; i < paths.length; i += 100) Object.assign(thumbs, await cs.signedURLs(paths.slice(i, i + 100)));

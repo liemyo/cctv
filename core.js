@@ -443,7 +443,13 @@ export const CLOUD = {
   base: 'https://bbptcxpzzvgpxqylkrmw.supabase.co',
   anon: 'sb_publishable_Ny-WHCEZ3WmcLFsPBx9QeQ_9xgo7MxR',
   bucket: 'pantau',
+  // Backblaze B2 via the klip worker (pantau/klip-worker), reached through a Supabase Edge Function because some ISPs
+  // block *.workers.dev. New files go there as <owner>/b2/<sn>/<name>; older files stay in the Supabase bucket until
+  // they roll off. null = everything in Supabase (700 MB).
+  b2: 'https://bbptcxpzzvgpxqylkrmw.supabase.co/functions/v1/pantau-klip',
+  supaQuota: 734003200,
 };
+export const isB2Path = p => typeof p === 'string' && p.split('/')[1] === 'b2';
 
 export class CloudStore {
   constructor(key) { this.key = key; }
@@ -463,16 +469,31 @@ export class CloudStore {
     return j;
   }
 
+  async b2(path, init = {}) {
+    const r = await fetch(CLOUD.b2 + path, { ...init, headers: { 'x-pantau-key': this.key, ...(init.headers || {}) } });
+    const j = await r.json().catch(() => null);
+    if (!r.ok) throw new JFError(r.status, `Cloud B2 ${r.status}: ${j?.error || 'gagal'}`);
+    return j;
+  }
+
+  /** used = Supabase + B2 bytes; quota = B2 quota when B2 is on (older Supabase files count against it). */
   async list({ before = null, limit = 120, sn = null } = {}) {
     const args = { p_limit: limit };
     if (before) args.p_before = before;
     if (sn) args.p_sn = sn;
-    const j = await this.rpc('pantau_list', args);
-    return { rows: j.rows || [], used: j.used || 0, count: j.count || 0 };
+    const [j, u] = await Promise.all([this.rpc('pantau_list', args), CLOUD.b2 && !before ? this.b2('/usage') : null]);
+    return { rows: j.rows || [], used: (j.used || 0) + (u?.used || 0), count: j.count || 0, quota: u?.quota || CLOUD.supaQuota };
   }
 
   async signedURLs(paths, expires = 3600) {
     if (!paths.length) return {};
+    const b2 = paths.filter(isB2Path);
+    if (b2.length) {
+      const [a, b] = await Promise.all([
+        this.b2('/sign', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: b2, expires }) }),
+        this.signedURLs(paths.filter(p => !isB2Path(p)), expires)]);
+      return { ...b, ...a };
+    }
     const r = await fetch(`${CLOUD.base}/storage/v1/object/sign/${CLOUD.bucket}`, {
       method: 'POST', headers: this.headers({ 'Content-Type': 'application/json' }), body: JSON.stringify({ expiresIn: expires, paths }),
     });
@@ -513,6 +534,10 @@ export class CloudStore {
   }
 
   async removePaths(prefixes) {
+    const b2 = prefixes.filter(isB2Path);
+    if (b2.length) await this.b2('/del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: b2 }) });
+    prefixes = prefixes.filter(p => !isB2Path(p));
+    if (!prefixes.length) return;
     await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}`, {
       method: 'DELETE', headers: this.headers({ 'Content-Type': 'application/json' }), body: JSON.stringify({ prefixes }),
     });
@@ -535,9 +560,14 @@ export class CloudStore {
     return null;
   }
 
-  async path(sn, name) { return `${await this.owner()}/${sn}/${name}`; }
+  async path(sn, name) { return `${await this.owner()}/${CLOUD.b2 ? 'b2/' : ''}${sn}/${name}`; }
 
   async upload(path, blob, mime) {
+    if (isB2Path(path)) {
+      const r = await fetch(`${CLOUD.b2}/o/${path}`, { method: 'PUT', body: blob, headers: { 'x-pantau-key': this.key, 'Content-Type': mime } });
+      if (!r.ok && r.status !== 409) throw new JFError(r.status, `Cloud B2 ${r.status}: ${(await r.json().catch(() => null))?.error || 'gagal'}`);
+      return;
+    }
     const r = await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}/${path}`, {
       method: 'POST', body: blob, headers: this.headers({ 'Content-Type': mime, 'cache-control': 'max-age=31536000' }),
     });
