@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
 import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=4';
-import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=5';
+import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=6';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -626,11 +626,11 @@ window.addEventListener('online', () => players.forEach(p => p.start()));
 
 // level: 'off' | LEVELS key (pixel motion). orang: 'off' | PLEVELS key (person detector, person.js) — both
 // on by default on every camera shown. foto/vid = save a photo / clip per event, pre = seconds recorded
-// before it (1–2; the whole clip is at most CLIP_MAX), cloud = upload to Klip Gerak (photo + mp4), dl = also download to this device.
-const WATCH0 = { level: 'agresif', last: 'agresif', orang: 'agresif', lastO: 'agresif', foto: true, vid: true, pre: 2, cloud: true, dl: false };
-const CLIP_MAX = 15000;
-// older versions saved pre 3/5/10 s, which put the motion 7+ s into the clip
-const watchCfg = () => { const c = { ...WATCH0, ...store.get('watch', {}) }; c.pre = Math.min(2, Math.max(1, +c.pre || 2)); return c; };
+// before it (always PRE; the whole clip is at most CLIP_MAX), cloud = upload to Klip Gerak (photo + mp4), dl = also download to this device.
+const PRE = 3, CLIP_MAX = 20000;
+const WATCH0 = { level: 'agresif', last: 'agresif', orang: 'agresif', lastO: 'agresif', foto: true, vid: true, pre: PRE, cloud: true, dl: false };
+// saved settings from older versions carry pre 1–10 s; the clip now always starts PRE s before the motion
+const watchCfg = () => ({ ...WATCH0, ...store.get('watch', {}), pre: PRE });
 S.caps = []; // this visit's captures, newest first: {id, sn, cam, at, photo, video, secs, pre} (object URLs)
 const capHooks = new Set();
 let cloudWarned = false;
@@ -828,7 +828,7 @@ function viewLive() {
             <div class="seg" id="po">${[['off', 'Mati'], ...Object.entries(PLEVELS).map(([k, v]) => [k, v.name])].map(([k, v]) => `<button data-po="${k}" class="${wc.orang === k ? 'on' : ''}">${v}</button>`).join('')}</div>
             <label class="tog"><input type="checkbox" data-w="foto" ${wc.foto ? 'checked' : ''}><span>Foto otomatis + kotak sorot</span></label>
             <label class="tog"><input type="checkbox" data-w="vid" ${wc.vid && PreRoll.supported() ? 'checked' : ''} ${PreRoll.supported() ? '' : 'disabled'}><span>Video otomatis, mulai
-              <select data-w="pre">${[1, 2].map(n => `<option value="${n}" ${wc.pre === n ? 'selected' : ''}>${n}</option>`).join('')}</select> dtk sebelum gerak, maks. 15 dtk${PreRoll.supported() ? '' : ' (tidak didukung browser ini)'}</span></label>
+              ${PRE} dtk sebelum gerak, maks. ${CLIP_MAX / 1000} dtk${PreRoll.supported() ? '' : ' (tidak didukung browser ini)'}</span></label>
             <label class="tog"><input type="checkbox" data-w="cloud" ${wc.cloud ? 'checked' : ''}><span>Simpan ke Klip Gerak (cloud)</span></label>
             <label class="tog"><input type="checkbox" data-w="dl" ${wc.dl ? 'checked' : ''}><span>Unduh otomatis ke perangkat ini</span></label>
             <div class="caps" id="caps"></div>
@@ -1014,7 +1014,6 @@ function viewLive() {
     document.querySelectorAll('[data-po]').forEach(x => x.classList.toggle('on', x === b));
   });
   document.querySelectorAll('input[data-w]').forEach(i => i.onchange = () => setWatch({ [i.dataset.w]: i.checked }));
-  $('select[data-w="pre"]').onchange = e => setWatch({ pre: +e.target.value });
   const capsBox = $('#caps'), onCap = c => { if (!$('#caps')) return capHooks.delete(onCap); if (c.sn === d.sn) drawCaps(capsBox, d.sn); };
   capHooks.add(onCap);
   drawCaps(capsBox, d.sn);
