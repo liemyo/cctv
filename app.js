@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
 import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=3';
-import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=4';
+import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=5';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -625,9 +625,11 @@ window.addEventListener('online', () => players.forEach(p => p.start()));
 
 // level: 'off' | LEVELS key (pixel motion). orang: 'off' | PLEVELS key (person detector, person.js) — both
 // on by default on every camera shown. foto/vid = save a photo / clip per event, pre = seconds recorded
-// before it, cloud = upload to Klip Gerak (photo + mp4), dl = also download to this device.
-const WATCH0 = { level: 'agresif', last: 'agresif', orang: 'agresif', lastO: 'agresif', foto: true, vid: true, pre: 5, cloud: true, dl: false };
-const watchCfg = () => ({ ...WATCH0, ...store.get('watch', {}) });
+// before it (1–2; the whole clip is at most CLIP_MAX), cloud = upload to Klip Gerak (photo + mp4), dl = also download to this device.
+const WATCH0 = { level: 'agresif', last: 'agresif', orang: 'agresif', lastO: 'agresif', foto: true, vid: true, pre: 2, cloud: true, dl: false };
+const CLIP_MAX = 15000;
+// older versions saved pre 3/5/10 s, which put the motion 7+ s into the clip
+const watchCfg = () => { const c = { ...WATCH0, ...store.get('watch', {}) }; c.pre = Math.min(2, Math.max(1, +c.pre || 2)); return c; };
 S.caps = []; // this visit's captures, newest first: {id, sn, cam, at, photo, video, secs, pre} (object URLs)
 const capHooks = new Set();
 let cloudWarned = false;
@@ -652,13 +654,14 @@ async function cloudSave(cap, kind, blob, mime, secs) {
 let personWarned = false;
 
 /** Runs the motion + person detectors on a player's video. onMotion(on, person) for the red frame / badge.
- *  An event starts on pixel motion or on a moving person and ends 6 s after both went quiet (max 60 s). */
+ *  An event starts on pixel motion or on a moving person and ends 6 s after both went quiet; its clip (pre-roll
+ *  included) is at most CLIP_MAX long. */
 function attachWatch(player, overlay, { onMotion = () => {} } = {}) {
   const dev = player.dev, video = player.video;
   let cfg = watchCfg(), ev = null, live = false, people = [], personAt = 0, endT = null;
-  const POST = 6000, MAX = 60000;
+  const POST = 6000;
   const w = new Watcher(video, overlay, {
-    level: cfg.level, post: 6, max: 60,
+    level: cfg.level, post: 6, max: CLIP_MAX / 1000,
     onStart: boxes => { eye.urgent(); if (!ev) begin(boxes, false); }, onEnd: () => maybeEnd(),
   });
   const eye = new PersonEye(video, {
@@ -679,13 +682,14 @@ function attachWatch(player, overlay, { onMotion = () => {} } = {}) {
   const maybeEnd = () => {
     if (!ev) return;
     const now = performance.now();
-    if (now - ev.since > MAX || (!w.active && now - personAt > POST)) end();
+    if (now - ev.since > CLIP_MAX - ev.pre || (!w.active && now - personAt > POST)) end();
   };
   const begin = async (boxes, person) => {
     const at = new Date(), cap = { id: `web-${at.getTime()}`, sn: dev.sn, cam: dev.name, at, person };
-    const e = ev = { cap, rec: cfg.vid ? pre.keep() : null, since: performance.now() };
+    const rec = cfg.vid ? pre.keep() : null;
+    const e = ev = { cap, rec, since: performance.now(), pre: rec ? Date.now() - rec.at : 0 };
     onMotion(true, person);
-    clearInterval(endT); endT = setInterval(maybeEnd, 1000);
+    clearInterval(endT); endT = setInterval(maybeEnd, 200);
     if (!cfg.foto && !e.rec) return;
     S.caps.unshift(cap);
     for (const old of S.caps.splice(120)) { URL.revokeObjectURL(old.photo); URL.revokeObjectURL(old.video); }
@@ -823,7 +827,7 @@ function viewLive() {
             <div class="seg" id="po">${[['off', 'Mati'], ...Object.entries(PLEVELS).map(([k, v]) => [k, v.name])].map(([k, v]) => `<button data-po="${k}" class="${wc.orang === k ? 'on' : ''}">${v}</button>`).join('')}</div>
             <label class="tog"><input type="checkbox" data-w="foto" ${wc.foto ? 'checked' : ''}><span>Foto otomatis + kotak sorot</span></label>
             <label class="tog"><input type="checkbox" data-w="vid" ${wc.vid && PreRoll.supported() ? 'checked' : ''} ${PreRoll.supported() ? '' : 'disabled'}><span>Video otomatis, mulai
-              <select data-w="pre">${[3, 5, 10].map(n => `<option value="${n}" ${wc.pre === n ? 'selected' : ''}>${n}</option>`).join('')}</select> dtk sebelum gerak${PreRoll.supported() ? '' : ' (tidak didukung browser ini)'}</span></label>
+              <select data-w="pre">${[1, 2].map(n => `<option value="${n}" ${wc.pre === n ? 'selected' : ''}>${n}</option>`).join('')}</select> dtk sebelum gerak, maks. 15 dtk${PreRoll.supported() ? '' : ' (tidak didukung browser ini)'}</span></label>
             <label class="tog"><input type="checkbox" data-w="cloud" ${wc.cloud ? 'checked' : ''}><span>Simpan ke Klip Gerak (cloud)</span></label>
             <label class="tog"><input type="checkbox" data-w="dl" ${wc.dl ? 'checked' : ''}><span>Unduh otomatis ke perangkat ini</span></label>
             <div class="caps" id="caps"></div>

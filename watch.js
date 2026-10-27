@@ -232,26 +232,26 @@ const MIMES = {
   v: ['video/mp4;codecs=avc1.42E01F', 'video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'],
 };
 
-/** Rolling pre-recorder: a new MediaRecorder starts every `pre` seconds and unused ones are dropped after
- *  1.5×pre, so there is always one running that began `pre`…2×pre seconds ago. keep() claims it for an
- *  event, finish() stops it — one ordinary video file that starts before the motion did. */
+/** Rolling pre-recorder: a new MediaRecorder starts every pre/2 seconds and unused ones are dropped once
+ *  older than `pre`, so there is always one running that began pre/2…pre seconds ago. keep() claims it for an
+ *  event, finish() stops it — one ordinary video file whose motion shows within the first `pre` seconds. */
 export class PreRoll {
   static supported() { const v = window.HTMLMediaElement?.prototype; return !!(window.MediaRecorder && v && (v.captureStream || v.mozCaptureStream)); }
 
-  constructor(video, { pre = 5, bits = 2.5e6 } = {}) { this.video = video; this.pre = pre; this.bits = bits; this.recs = []; }
+  constructor(video, { pre = 2, bits = 2.5e6 } = {}) { this.video = video; this.pre = pre; this.bits = bits; this.recs = []; }
 
   start() {
     this.stop();
     try { this.stream = this.video.captureStream?.() || this.video.mozCaptureStream?.(); } catch { this.stream = null; }
     if (!this.stream || !window.MediaRecorder) return false;
     this.rotate();
-    this.timer = setInterval(() => this.rotate(), this.pre * 1000);
+    this.timer = setInterval(() => this.rotate(), this.pre * 500);
     return true;
   }
 
   rotate() {
     const now = Date.now();
-    for (const r of [...this.recs]) if (!r.keep && (now - r.at > this.pre * 1500 || r.dead)) this.drop(r);
+    for (const r of [...this.recs]) if (!r.keep && (now - r.at > this.pre * 1000 + 150 || r.dead)) this.drop(r);
     if (!this.stream.getVideoTracks().some(t => t.readyState === 'live')) return;
     const r = this.make();
     if (r) this.recs.push(r);
@@ -279,9 +279,10 @@ export class PreRoll {
     try { if (r.m.state !== 'inactive') r.m.stop(); } catch {}
   }
 
-  /** Claims the oldest running recorder (longest pre-roll) for an event. */
+  /** Claims the oldest running recorder that began at most `pre` s ago (timer jitter aside) for an event. */
   keep() {
-    const r = this.recs.filter(x => !x.keep && !x.dead).sort((a, b) => a.at - b.at)[0];
+    const now = Date.now(), ok = this.recs.filter(x => !x.keep && !x.dead).sort((a, b) => a.at - b.at);
+    const r = ok.find(x => now - x.at <= this.pre * 1000 + 150) || ok[ok.length - 1];
     if (r) { r.keep = true; r.claimed = Date.now(); }
     return r || null;
   }
