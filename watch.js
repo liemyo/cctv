@@ -236,10 +236,10 @@ const MIMES = {
  *  pre + EVERY, so one of them began pre … pre + EVERY ago. keep() claims the youngest that is at least `pre` old
  *  for an event, finish() stops it — one ordinary video file that starts at least `pre` seconds before the motion. */
 export class PreRoll {
-  static EVERY = 750;
+  static EVERY = 1000;
   static supported() { const v = window.HTMLMediaElement?.prototype; return !!(window.MediaRecorder && v && (v.captureStream || v.mozCaptureStream)); }
 
-  constructor(video, { pre = 3, bits = 2.5e6 } = {}) { this.video = video; this.pre = pre; this.bits = bits; this.recs = []; }
+  constructor(video, { pre = 5, bits = 2.5e6 } = {}) { this.video = video; this.pre = pre; this.bits = bits; this.recs = []; }
 
   start() {
     this.stop();

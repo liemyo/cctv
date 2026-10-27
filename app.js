@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
 import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=6';
-import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=6';
+import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=7';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -627,7 +627,7 @@ window.addEventListener('online', () => players.forEach(p => p.start()));
 // level: 'off' | LEVELS key (pixel motion). orang: 'off' | PLEVELS key (person detector, person.js) — both
 // on by default on every camera shown. foto/vid = save a photo / clip per event, pre = seconds recorded
 // before it (always PRE; the whole clip is at most CLIP_MAX), cloud = upload to Klip Gerak (photo + mp4), dl = also download to this device.
-const PRE = 3, CLIP_MAX = 20000;
+const PRE = 5, CLIP_MAX = 25000;
 const WATCH0 = { level: 'agresif', last: 'agresif', orang: 'agresif', lastO: 'agresif', foto: true, vid: true, pre: PRE, cloud: true, dl: false };
 // saved settings from older versions carry pre 1–10 s; the clip now always starts PRE s before the motion
 const watchCfg = () => ({ ...WATCH0, ...store.get('watch', {}), pre: PRE });
