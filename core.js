@@ -445,8 +445,9 @@ export const CLOUD = {
   bucket: 'pantau',
   // Backblaze B2 via the klip worker (pantau/klip-worker), reached through a Supabase Edge Function because some ISPs
   // block *.workers.dev. New files go there as <owner>/b2/<sn>/<name>; older files stay in the Supabase bucket until
-  // they roll off. null = everything in Supabase (700 MB).
-  b2: 'https://bbptcxpzzvgpxqylkrmw.supabase.co/functions/v1/pantau-klip',
+  // they roll off. null = everything in Supabase (700 MB). 2026-10-27: CCTV taken off B2 at the user's request (the B2
+  // space now belongs to the other sites); old B2 clips are no longer shown.
+  b2: null,
   supaQuota: 734003200,
 };
 export const isB2Path = p => typeof p === 'string' && p.split('/')[1] === 'b2';
@@ -486,6 +487,8 @@ export class CloudStore {
   }
 
   async signedURLs(paths, expires = 3600) {
+    if (!paths.length) return {};
+    if (!CLOUD.b2) paths = paths.filter(p => !isB2Path(p));
     if (!paths.length) return {};
     const b2 = paths.filter(isB2Path);
     if (b2.length) {
@@ -535,7 +538,7 @@ export class CloudStore {
 
   async removePaths(prefixes) {
     const b2 = prefixes.filter(isB2Path);
-    if (b2.length) await this.b2('/del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: b2 }) });
+    if (b2.length && CLOUD.b2) await this.b2('/del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: b2 }) });
     prefixes = prefixes.filter(p => !isB2Path(p));
     if (!prefixes.length) return;
     await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}`, {

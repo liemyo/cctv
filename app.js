@@ -1,5 +1,5 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=4';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=5';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=6';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
