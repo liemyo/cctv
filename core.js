@@ -440,15 +440,13 @@ export class JFClient {
 // ---------- Supabase motion clips (same backend the Mac app uploads to) ----------
 
 export const CLOUD = {
-  base: 'https://bbptcxpzzvgpxqylkrmw.supabase.co',
-  anon: 'sb_publishable_Ny-WHCEZ3WmcLFsPBx9QeQ_9xgo7MxR',
+  // 2026-10-28: own Supabase project "cctv" on the account lyctusking@gmail.com (SQL in pantau/supabase-pantau.sql).
+  base: 'https://oazanptfzembkdtvfjui.supabase.co',
+  anon: 'sb_publishable_OfZssnE8Q76nfQrW1PoAsQ_O6WJuvgY',
   bucket: 'pantau',
-  // Backblaze B2 via the klip worker (pantau/klip-worker), reached through a Supabase Edge Function because some ISPs
-  // block *.workers.dev. New files go there as <owner>/b2/<sn>/<name>; older files stay in the Supabase bucket until
-  // they roll off. null = everything in Supabase (700 MB). 2026-10-28: the gateway now leads to Worker cctv-klip on the
-  // Backblaze account lyctusking@gmail.com (bucket liemyo25); clips from the old account were removed.
-  b2: 'https://bbptcxpzzvgpxqylkrmw.supabase.co/functions/v1/pantau-klip',
-  supaQuota: 734003200,
+  // Backblaze B2 is no longer used (null). The b2 code paths stay so stray <owner>/b2/… paths are skipped safely.
+  b2: null,
+  supaQuota: 943718400,
 };
 export const isB2Path = p => typeof p === 'string' && p.split('/')[1] === 'b2';
 
