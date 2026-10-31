@@ -284,7 +284,7 @@ export function installHik(x) {
     };
     const keyForm = msg => {
       setMsg(null, false, `<div class="hkey">${ic('light')}<b>${esc(msg)}</b>
-        <input class="input" id="kc" placeholder="Kode verifikasi (6 huruf)" maxlength="16" autocapitalize="characters">
+        <input class="input" id="kc" placeholder="Kode / sandi enkripsi" maxlength="60" autocapitalize="off" autocomplete="off" spellcheck="false">
         <button class="btn primary" id="ks">Simpan & putar</button></div>`);
       $('#ks').onclick = async () => {
         try { await api.setKey(sn, $('#kc').value); toast('Kode disimpan di relay'); start(player.stream); } catch (e) { toast(e.message); }
@@ -542,8 +542,8 @@ export function installHik(x) {
       const devs = R.devices.length ? R.devices : await api.devices().catch(() => []);
       $('#hkeys').innerHTML = `<details><summary>Kode verifikasi perangkat (untuk video terenkripsi)</summary><div style="display:grid;gap:8px;margin-top:8px">
         ${devs.map(d => `<div class="row"><span>${esc(d.name)}${d.hasKey ? ' · <b>tersimpan</b>' : ''}</span><span class="spacer"></span>
-          <input class="input" style="max-width:140px" data-kc="${esc(d.sn)}" placeholder="ABCDEF" maxlength="16"><button class="btn" data-ks="${esc(d.sn)}">Simpan</button></div>`).join('')}
-        <div class="muted small">Kode 6 huruf ada di label NVR. Kosongkan lalu Simpan untuk menghapus.</div></div></details>`;
+          <input class="input" style="max-width:140px" data-kc="${esc(d.sn)}" placeholder="kode atau sandi" maxlength="60" autocapitalize="off" autocomplete="off" spellcheck="false"><button class="btn" data-ks="${esc(d.sn)}">Simpan</button></div>`).join('')}
+        <div class="muted small">Kode di label NVR atau sandi enkripsi yang dipasang (huruf besar/kecil berpengaruh). Boleh beberapa sekaligus, mis. "kode1 atau kode2" — relay memakai yang cocok. Kosongkan lalu Simpan untuk menghapus.</div></div></details>`;
       document.querySelectorAll('[data-ks]').forEach(b => b.onclick = async () => {
         try { await api.setKey(b.dataset.ks, document.querySelector(`[data-kc="${CSS.escape(b.dataset.ks)}"]`).value); toast('Disimpan'); api.devices(true).then(sayaBind); } catch (e) { toast(e.message); }
       });
