@@ -372,9 +372,8 @@ export function installHik(x) {
         <div class="seg">${[1, 2, 3, 4].map(k => `<button data-n="${k}" class="${k === n ? 'on' : ''}">${k === 1 ? '1' : `${k}×${k}`}</button>`).join('')}</div>`)}
       ${!R.base && !R.devices.length ? relayBox() : ''}
       <div class="multi ${cover ? 'cover' : ''}" style="--mcols:repeat(${cols},minmax(0,1fr));--mrows:repeat(${rows},minmax(0,1fr));--pcols:repeat(${n === 1 ? 1 : 2},minmax(0,1fr))">${cams.map(({ d, c }) => `
-        <div class="tile" data-hid="${esc(d.sn)}.${c.ch}" ${c.locked ? 'data-locked' : ''}><video playsinline muted autoplay></video>
-          ${c.locked ? `<div class="tlock">${ic('lock')}<span>Terkunci · isi kode verifikasi ${esc(d.name)} di Saya</span></div>` : ''}
-          <span class="badge"><i class="dot ${c.locked ? 'offline' : ''}"></i>${esc(c.name)}</span></div>`).join('')}</div>
+        <div class="tile" data-hid="${esc(d.sn)}.${c.ch}"><video playsinline muted autoplay></video>
+          <span class="badge"><i class="dot"></i>${esc(c.name)}</span></div>`).join('')}</div>
       <button class="btn icon mexit" title="Tutup">${ic('x')}</button>`;
     bindRetry();
     document.querySelectorAll('.seg [data-n]').forEach(b => b.onclick = () => { store.set('hikMultiN', +b.dataset.n); store.set('hikMultiPage', 0); route(); });
@@ -386,11 +385,10 @@ export function installHik(x) {
     document.querySelectorAll('.tile').forEach(t => {
       const { sn, ch } = parseId(t.dataset.hid), dot = t.querySelector('.dot');
       t.onclick = () => go('hiklive', t.dataset.hid);
-      if (t.hasAttribute('data-locked')) return;
       const p = new HikPlayer(t.querySelector('video'), sn, ch, {
         stream: n === 1 ? '0' : '1',
         onState: (s, v) => {
-          if (s === 'off' || s === 'key') t.insertAdjacentHTML('beforeend', `<div class="tlock">${ic(s === 'key' ? 'lock' : 'cam')}<span>${esc(v)}</span></div>`);
+          if (s === 'off' || s === 'key') t.insertAdjacentHTML('beforeend', `<div class="tlock">${ic(s === 'key' ? 'lock' : 'cam')}<span>${esc(s === 'key' ? `Terkunci · isi kode ${dev(sn)?.name || ''} di Saya` : v)}</span></div>`);
           dot.className = 'dot ' + (s === 'play' || s === 'tick' ? 'online' : s === 'retry' || s === 'key' || s === 'off' ? 'offline' : 'sleeping');
           t.classList.toggle('wait', s === 'connect' || s === 'retry');
         },
