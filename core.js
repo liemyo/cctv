@@ -508,8 +508,12 @@ export class CloudStore {
   // labelled image/jpeg). Each save is a new file named by its timestamp; the newest one wins.
   async owner() { return this._owner ||= await sha256Hex(this.key); }
 
-  async getPrefs() {
-    const dir = `${await this.owner()}/web-prefs/`;
+  async getPrefs() { return this.getDoc('web-prefs'); }
+  async putPrefs(prefs, opts) { return this.putDoc('web-prefs', prefs, opts); }
+
+  /** Newest JSON file in <owner>/<name>/ (web settings, the Hik-Connect relay address). */
+  async getDoc(name) {
+    const dir = `${await this.owner()}/${name}/`;
     const r = await fetch(`${CLOUD.base}/storage/v1/object/list/${CLOUD.bucket}`, {
       method: 'POST', headers: this.headers({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ prefix: dir, limit: 20, sortBy: { column: 'name', order: 'desc' } }),
@@ -524,10 +528,10 @@ export class CloudStore {
     return j;
   }
 
-  async putPrefs(prefs, { keepalive = false, old = [] } = {}) {
-    const dir = `${await this.owner()}/web-prefs/`;
-    const r = await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}/${dir}${prefs.t}.jpg`, {
-      method: 'POST', keepalive, body: JSON.stringify(prefs),
+  async putDoc(name, doc, { keepalive = false, old = [] } = {}) {
+    const dir = `${await this.owner()}/${name}/`;
+    const r = await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}/${dir}${doc.t}.jpg`, {
+      method: 'POST', keepalive, body: JSON.stringify(doc),
       headers: this.headers({ 'Content-Type': 'image/jpeg', 'cache-control': 'max-age=0' }),
     });
     if (!r.ok && r.status !== 409) throw new JFError(r.status, `Cloud ${r.status}`);

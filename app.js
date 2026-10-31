@@ -1,5 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=7';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=8';
+import { installHik } from './hikweb.js?v=6';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=7';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
@@ -18,6 +19,7 @@ const ICON = {
   cam: '<path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h9A2.5 2.5 0 0 1 17 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-9A2.5 2.5 0 0 1 3 16.5z"/><path d="m17 10 4-2.5v9L17 14"/>',
   grid: '<rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="8" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/><rect x="13" y="13" width="8" height="8" rx="2"/>',
   bell: '<path d="M6 16V11a6 6 0 1 1 12 0v5l1.5 2h-15z"/><path d="M10 20a2 2 0 0 0 4 0"/>',
+  lock: '<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5"/>',
   film: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>',
   user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
   back: '<path d="m15 5-7 7 7 7"/>',
@@ -110,14 +112,15 @@ function go(view, sn) {
 }
 
 // screen order for the slide direction: further right = slides in from the right
-const DEPTH = { cams: 0, live: 0.5, multi: 1, pesan: 2, klip: 3, saya: 4 };
+const DEPTH = { cams: 0, live: 0.5, multi: 1, pesan: 2, klip: 3, saya: 4, hik: 5, hiklive: 5.5, hikmulti: 6, hikplay: 7, hikpesan: 8 };
 
 function route() {
   const [view, sn] = location.hash.slice(1).split('/');
-  const next = !S.session ? 'login' : VIEWS.some(v => v[0] === view) || view === 'live' ? view : 'cams';
+  const next = !S.session ? 'login' : VIEWS.some(v => v[0] === view) || view === 'live' || HIK.views[view] ? view : 'cams';
   const dir = next === S.view ? 'same' : (DEPTH[next] ?? -1) > (DEPTH[S.view] ?? -1) ? 'fwd' : 'back';
   smooth(() => {
     stopAllPlayers();
+    hikCtx.onLeave?.(); hikCtx.onLeave = null;
     clearInterval(S.tick);
     if (!S.session) { S.view = 'login'; renderLogin(); return; }
     S.view = next;
@@ -154,21 +157,27 @@ function smooth(update, dir) {
 window.addEventListener('hashchange', route);
 
 function renderShell() {
-  document.body.dataset.view = S.view;
-  const nav = cls => VIEWS.map(([k, label, icon]) =>
-    `<button class="nav ${S.view === k || (S.view === 'live' && k === 'cams') ? 'active' : ''}" data-go="${k}">${ic(icon)}<span>${label}</span></button>`).join('');
+  document.body.dataset.view = { hiklive: 'live', hikmulti: 'multi' }[S.view] || S.view;
+  const isHik = S.view.startsWith('hik');
+  document.body.dataset.app = isHik ? 'hik' : 'icsee';
+  const btn = ([k, label, icon]) =>
+    `<button class="nav ${S.view === k || (S.view === 'live' && k === 'cams') || (S.view === 'hiklive' && k === 'hik') ? 'active' : ''}" data-go="${k}">${ic(icon)}<span>${label}</span></button>`;
+  // sidebar: both apps, each under its own heading; phone tab bar: the current app + a switch to the other one
+  const nav = tab => tab
+    ? [...(isHik ? [...HIK.nav, VIEWS[4]] : VIEWS)].map(btn).join('') + `<button class="nav sw" data-go="${isHik ? 'cams' : 'hik'}">${ic('refresh')}<span>${isHik ? 'iCSee' : 'Hik'}</span></button>`
+    : `<div class="navh">iCSee</div>${VIEWS.slice(0, 4).map(btn).join('')}<div class="navh hk">Hik-Connect</div>${HIK.nav.map(btn).join('')}<div class="navh"></div>${btn(VIEWS[4])}`;
   $('#root').innerHTML = `
     <div class="app ${store.get('sideOff', false) ? 'side-off' : ''}">
       <aside class="side"><div class="glass">
         <div class="brand"><img src="icon-192.png" alt="">Pantau<button class="btn icon" data-side title="Sembunyikan menu ( \\ )">${ic('sidebar')}</button></div>
-        ${nav()}
+        ${nav(false)}
         <div class="foot">${esc(S.session.account)}</div>
       </div></aside>
       <main id="main"></main>
     </div>
-    <nav class="tabbar glass">${nav()}</nav>`;
+    <nav class="tabbar glass">${nav(true)}</nav>`;
   document.querySelectorAll('[data-go]').forEach(b => b.onclick = () => go(b.dataset.go));
-  ({ cams: viewCams, live: viewLive, multi: viewMulti, pesan: viewPesan, klip: viewKlip, saya: viewSaya })[S.view]();
+  ({ cams: viewCams, live: viewLive, multi: viewMulti, pesan: viewPesan, klip: viewKlip, saya: viewSaya, ...HIK.views })[S.view]();
 }
 
 /** Page header. The sidebar button only shows while the sidebar is hidden (desktop). */
@@ -418,7 +427,7 @@ class LivePlayer {
     const v = this.video;
     if (v.paused || v.seeking || !v.buffered.length) return;
     const end = v.buffered.end(v.buffered.length - 1);
-    const max = this.mode === 'flv' ? 1.5 : 5, keep = this.mode === 'flv' ? 0.3 : 1.5;
+    const max = this.edgeMax ?? (this.mode === 'flv' ? 1.5 : 5), keep = this.edgeKeep ?? (this.mode === 'flv' ? 0.3 : 1.5);
     if (end - v.currentTime > max) v.currentTime = end - keep;
     else if (this.hls?.latency > 9 && this.hls.liveSyncPosition) v.currentTime = this.hls.liveSyncPosition;
   }
@@ -543,8 +552,8 @@ class LivePlayer {
         still += 1;
         if (started && (still === 2 || still === 4)) this.nudge();
         if (started && still === 2) this.onState('stall');
-        if (still < (!started ? 14 : this.mode === 'flv' ? 5 : 9)) return;
-        if (started && this.mode === 'flv' && store.get('mode', 'auto') === 'auto') {
+        if (still < (!started ? 14 : this.stillMax ?? (this.mode === 'flv' ? 5 : 9))) return;
+        if (started && this.mode === 'flv' && !this.flvOnly && store.get('mode', 'auto') === 'auto') {
           S.flvFrozen = true; this.fails = 2;
           this.retry('Gambar macet');
         } else {
@@ -558,7 +567,7 @@ class LivePlayer {
   retry(why) {
     if (this.stopped) return;
     this.watcher?.pause();
-    if (this.mode === 'flv' && this.fails >= 2 && store.get('mode', 'auto') !== 'flv') { this.mode = 'hls'; this.fails = 0; why += ' — beralih ke mode stabil'; }
+    if (this.mode === 'flv' && !this.flvOnly && this.fails >= 2 && store.get('mode', 'auto') !== 'flv') { this.mode = 'hls'; this.fails = 0; why += ' — beralih ke mode stabil'; }
     this.onState('retry', why);
     this.keepFrame();
     this.teardown();
@@ -1356,6 +1365,7 @@ function viewSaya() {
           <div class="muted small">Semua setelan di situs ini tersimpan otomatis ke cloud dan ikut di browser / perangkat lain${prefsState === 'err' ? ' — <b style="color:var(--warn)">gagal sinkron, dicoba lagi saat ada perubahan</b>' : ''}.</div>`
           : '<div class="muted small">Belum terhubung — buka tab Klip Gerak.</div>'}
       </div>
+      ${HIK.sayaCard()}
       <div class="glass">
         <h3>Kunci platform</h3>
         <div class="muted small">AppKey <code class="k">${esc(keys.appKey.slice(0, 6))}…</code> ·
@@ -1370,6 +1380,7 @@ function viewSaya() {
   document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { store.set('theme', b.dataset.t); applyTheme(); route(); });
   document.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { store.set('mode', b.dataset.m); route(); });
   $('#ck') && ($('#ck').onclick = () => { store.raw('cloudKey', null); store.raw('cloudOff', true); route(); });
+  HIK.sayaBind();
 }
 
 // ---------- demo (?demo=1): sample data, never touches the saved session ----------
@@ -1403,6 +1414,13 @@ if (new URLSearchParams(location.search).has('demo')) {
     setSensitivity: async (d, k) => ({ on: true, level: SENS[k].level, latch: SENS[k].latch, human: SENS[k].human, box: SENS[k].box, track: SENS[k].track, tracking: false, preset: k }),
   });
 }
+
+// ---------- Hik-Connect (hikweb.js) ----------
+
+const hikCtx = {
+  $, esc, ic, topbar, store, toast, go, route, LivePlayer, within, fileStamp, saveBlob, openViewer, dayLabel, timeLabel, S, cloud, ensureCloudKey,
+};
+const HIK = installHik(hikCtx);
 
 // ---------- boot ----------
 

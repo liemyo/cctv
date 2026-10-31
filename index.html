@@ -271,6 +271,52 @@ code.k { font: 12px ui-monospace, Menlo, monospace; word-break: break-all; }
   padding: 9px 16px; border-radius: 99px; max-width: calc(100% - 32px); text-align: center; font-size: 13px;
 }
 
+
+/* ---------- Hik-Connect (own accent so the two apps are easy to tell apart) ---------- */
+body[data-app="hik"] { --accent: #e0313a; --accent-ink: #fff; }
+.navh { margin: 10px 10px 2px; font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ink3); }
+.navh:first-of-type { margin-top: 2px; }
+.navh.hk { color: #e0313a; }
+.navh:empty { margin: 6px 10px; border-top: 1px solid var(--edge); }
+.hdevs { display: grid; gap: 12px; }
+.hdev { padding: 10px 12px 12px; border-radius: 20px; }
+.hdev header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.hdev.shut header { margin-bottom: 0; }
+.hdev.shut .grid { display: none; }
+.hdev .hname { display: grid; gap: 2px; min-width: 0; }
+.hdev .hname b { font-size: 15px; }
+.hdev .hname span { display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.htog { border: 0; background: none; color: var(--ink2); padding: 4px; border-radius: 8px; transition: transform .2s; }
+.hdev.shut .htog { transform: rotate(-90deg); }
+.hdev .grid { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.thumb > img:not([src]) { display: none; }
+.badge.lock { left: auto; right: 8px; background: rgba(224,49,58,.8); }
+.tile .tlock { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; padding: 16px; text-align: center; font-size: 13px; color: var(--muted); }
+.tile .tlock .i { width: 26px; height: 26px; color: #e0313a; }
+.chip.hc { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+.hrelay { display: flex; gap: 14px; align-items: flex-start; text-align: left; max-width: 620px; margin-top: 12px; }
+.hrelay > svg { width: 34px; height: 34px; flex: none; color: #e0313a; }
+.hrelay > div { display: grid; gap: 8px; justify-items: start; }
+.hchs { display: grid; gap: 6px; }
+.hch { display: flex; align-items: center; gap: 8px; padding: 4px; border-radius: 12px; border: 1px solid transparent; background: none; text-align: left; color: var(--ink); font-size: 13px; }
+.hch:hover { background: var(--glass2); }
+.hch.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.hcth { width: 64px; aspect-ratio: 16/9; border-radius: 8px; background: #0b0f16; position: relative; overflow: hidden; display: grid; place-items: center; color: #fff6; flex: none; }
+.hcth svg { width: 16px; height: 16px; }
+.hcth img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.hcth img:not([src]) { display: none; }
+.hkey { pointer-events: auto; display: grid; gap: 10px; justify-items: center; max-width: 300px; background: rgba(0,0,0,.55); padding: 16px; border-radius: 16px; }
+.hkey svg { width: 26px; height: 26px; }
+.hplay { flex: 1; min-height: 0; display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 10px; }
+.hplay .stage video { object-fit: contain; }
+.htl { padding: 12px 14px; display: grid; gap: 8px; }
+.tlbar { position: relative; height: 34px; border-radius: 10px; background: var(--glass2); border: 1px solid var(--edge); cursor: pointer; overflow: hidden; }
+.tlseg i { position: absolute; top: 6px; bottom: 6px; background: var(--accent); border-radius: 3px; opacity: .85; }
+.tlcur { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ink); left: -4px; pointer-events: none; }
+.tlticks { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--ink3); }
+.hsegs { display: flex; gap: 6px; flex-wrap: wrap; max-height: 96px; overflow: auto; }
+.top select.input, .top input.input { width: auto; height: 34px; font-size: 13px; }
+
 /* ---------- phone / small screens ---------- */
 @media (max-width: 820px), (orientation: landscape) and (max-height: 540px) {
   .app, .app.side-off { --sw: 0px; display: block; height: auto; min-height: 100dvh; }
@@ -290,6 +336,15 @@ code.k { font: 12px ui-monospace, Menlo, monospace; word-break: break-all; }
   .tabbar .nav svg.i { width: 21px; height: 21px; }
   .tabbar .nav.active { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); box-shadow: none; }
   .toast { bottom: calc(76px + env(safe-area-inset-bottom)); }
+  .tabbar .nav.sw { color: var(--ink3); }
+  .hdev { padding: 8px 8px 10px; border-radius: 16px; }
+  .hdev header { flex-wrap: wrap; gap: 6px 8px; }
+  .hdev header .btn.lbl span { display: none; }
+  .hdev .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .live .panel .hchs { grid-column: 1 / -1; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .hplay { display: block; }
+  .hplay .stage { margin-bottom: 8px; }
+  .top select.input { max-width: 46vw; }
 
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .cam { border-radius: 14px; }
@@ -401,6 +456,6 @@ body[data-view="multi"]::before, body[data-view="multi"]::after { animation-play
 </head>
 <body>
 <div id="root"></div>
-<script type="module" src="app.js?v=18"></script>
+<script type="module" src="app.js?v=24"></script>
 </body>
 </html>
