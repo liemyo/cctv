@@ -324,24 +324,55 @@ async function refreshDevices() {
   S.status = await api.status(S.devices);
 }
 
+const ST_LABEL = { online: 'Online', sleeping: 'Tidur', offline: 'Offline', unknown: '…' };
+
 function camCard(d) {
   const st = S.status[d.sn] || 'unknown';
-  const label = { online: 'Online', sleeping: 'Tidur', offline: 'Offline', unknown: '…' }[st];
   return `<button class="cam glass" data-sn="${esc(d.sn)}">
     <div class="thumb">${S.thumbs[d.sn] ? `<img src="${S.thumbs[d.sn]}" alt="">` : ic('cam')}
-      <span class="badge"><i class="dot ${st}"></i>${label}</span></div>
+      <video playsinline muted autoplay disablepictureinpicture></video>
+      <span class="badge"><i class="dot ${st}"></i><span>${ST_LABEL[st]}</span></span><div class="tmsg"></div></div>
     <div class="meta"><div><b>${esc(d.name)}</b><div class="sn">${esc(d.sn)}</div></div><span class="spacer"></span>${ic('right')}</div>
   </button>`;
 }
 
+/** Each card plays the camera's SD stream live (muted + inline, so phones start it without a tap).
+ *  Sleeping (battery) and offline cameras are not woken here; why a stream fails is written on its card. */
 async function viewCams() {
   const main = $('#main');
+  let shown = '';
   const draw = () => {
+    stopAllPlayers();
+    shown = S.devices.map(d => d.sn + d.name).join('|');
     main.innerHTML = `
       ${topbar('Kamera', `<button class="btn lbl" id="rf" title="Segarkan">${ic('refresh')}<span>Segarkan</span></button>`)}
       ${S.devices.length ? `<div class="grid">${S.devices.map(camCard).join('')}</div>` : '<div class="empty glass">Memuat kamera…</div>'}`;
     main.querySelectorAll('.cam').forEach(c => c.onclick = () => go('live', c.dataset.sn));
     $('#rf').onclick = () => { S.thumbs = {}; load(true); };
+  };
+  const card = sn => main.querySelector(`.cam[data-sn="${CSS.escape(sn)}"]`);
+  const setCard = (c, dot, label, msg) => {
+    c.querySelector('.badge').innerHTML = `<i class="dot ${dot}"></i><span>${esc(label)}</span>`;
+    c.querySelector('.tmsg').textContent = msg || '';
+  };
+  const live = new Map(); // sn → LivePlayer
+  const play = d => {
+    const c = card(d.sn), st = S.status[d.sn] || 'unknown';
+    if (!c || live.has(d.sn)) return;
+    if (st === 'sleeping') return setCard(c, 'sleeping', 'Tidur', 'Kamera tidur (baterai) — ketuk untuk membangunkan');
+    if (st === 'offline') return setCard(c, 'offline', 'Offline', 'Kamera offline — periksa listrik / Wi-Fi kamera');
+    const p = new LivePlayer(c.querySelector('video'), d, {
+      stream: '1',
+      onState: (s, x) => {
+        c.classList.toggle('playing', s === 'play' || s === 'tick');
+        if (s === 'connect') setCard(c, 'sleeping', 'Menyambung', '');
+        if (s === 'play') setCard(c, 'online', 'LIVE', '');
+        if (s === 'retry') setCard(c, 'offline', 'Gagal', `${x}${p.fails > 1 ? ` (percobaan ${p.fails})` : ''}`);
+        if (s === 'blocked') setCard(c, 'sleeping', 'Dijeda', 'Ketuk untuk memutar video');
+      },
+    });
+    live.set(d.sn, p);
+    p.start();
   };
   const snap = all => {
     for (const d of S.devices) {
@@ -349,20 +380,27 @@ async function viewCams() {
       if (S.status[d.sn] && S.status[d.sn] !== 'online') continue;
       api.capture(d).then(blob => blobToDataURL(blob)).then(url => {
         S.thumbs[d.sn] = url; store.set('thumbs', S.thumbs);
-        if (S.view === 'cams') draw();
-      }).catch(() => {});
+        const c = S.view === 'cams' && card(d.sn);
+        if (!c) return;
+        const img = c.querySelector('.thumb > img') || c.querySelector('.thumb').insertAdjacentElement('afterbegin', document.createElement('img'));
+        img.src = url;
+        c.querySelector('.thumb > svg')?.remove();
+      }).catch(e => console.warn('snapshot', d.sn, e)); // the live stream on the card reports the real failure
     }
   };
   const load = async (thumbs) => {
-    draw();
+    if (thumbs || !main.querySelector('.grid')) { live.clear(); draw(); }
     await refreshDevices();
     if (S.view !== 'cams') return;
-    draw();
+    if (S.devices.map(d => d.sn + d.name).join('|') !== shown) { live.clear(); draw(); }
+    for (const d of S.devices) {
+      const c = card(d.sn), st = S.status[d.sn] || 'unknown';
+      if (c && !live.has(d.sn)) setCard(c, st, ST_LABEL[st], '');
+      play(d);
+    }
     snap(thumbs);
   };
   load(false);
-  // keep the preview pictures fresh while this page is open
-  S.tick = setInterval(() => { if (!document.hidden && S.view === 'cams') snap(true); }, 45000);
 }
 
 const blobToDataURL = blob => new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = bad; r.readAsDataURL(blob); });
@@ -1087,7 +1125,7 @@ function viewMulti() {
       <div class="seg">${[1, 2, 3].map(k => `<button data-n="${k}" class="${k === n ? 'on' : ''}">${k === 1 ? '1' : `${k}×${k}`}</button>`).join('')}</div>`)}
     <div class="multi ${cover ? 'cover' : ''}" style="--mcols:repeat(${cols},minmax(0,1fr));--mrows:repeat(${rows},minmax(0,1fr));--pcols:repeat(${n === 1 ? 1 : 2},minmax(0,1fr))">${cams.map(d => `
       <div class="tile" data-sn="${esc(d.sn)}"><video playsinline muted autoplay></video><canvas class="ov"></canvas>
-        <span class="badge"><i class="dot"></i>${esc(d.name)}</span></div>`).join('')}</div>
+        <span class="badge"><i class="dot"></i>${esc(d.name)}</span><div class="tmsg"></div></div>`).join('')}</div>
     <button class="btn icon mexit" data-go="cams" title="Tutup">${ic('x')}</button>`;
   document.querySelectorAll('.seg [data-n]').forEach(b => b.onclick = () => { store.set('multiN', +b.dataset.n); route(); });
   $('#mc').onclick = () => { const on = !$('.multi').classList.contains('cover'); $('.multi').classList.toggle('cover', on); $('#mc').classList.toggle('on', on); store.set('multiCover', on); };
@@ -1105,12 +1143,15 @@ function viewMulti() {
     toast(watchCfg().level === 'off' ? 'Deteksi gerak dimatikan' : `Deteksi gerak ${LEVELS[watchCfg().level].name} di semua layar`);
   };
   document.querySelectorAll('.tile').forEach(t => {
-    const d = devBySn(t.dataset.sn), dot = t.querySelector('.dot');
+    const d = devBySn(t.dataset.sn), dot = t.querySelector('.dot'), msg = t.querySelector('.tmsg');
     const p = new LivePlayer(t.querySelector('video'), d, {
       stream: n === 1 ? '0' : '1',
-      onState: s => {
+      onState: (s, x) => {
         dot.className = 'dot ' + (s === 'play' || s === 'tick' ? 'online' : s === 'retry' ? 'offline' : 'sleeping');
         t.classList.toggle('wait', s === 'connect' || s === 'retry');
+        if (s === 'retry') msg.textContent = x || 'Gagal menyambung';
+        else if (s === 'play') msg.textContent = '';
+        else if (s === 'blocked') msg.textContent = 'Ketuk untuk memutar video';
       },
     });
     attachWatch(p, t.querySelector('.ov'), { onMotion: (m, pp) => { t.classList.toggle('motion', m); t.classList.toggle('person', !!(m && pp)); } });
