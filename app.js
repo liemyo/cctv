@@ -121,6 +121,7 @@ function route() {
   smooth(() => {
     stopAllPlayers();
     hikCtx.onLeave?.(); hikCtx.onLeave = null;
+    liveKeys?.stop(); liveKeys = null;
     clearInterval(S.tick);
     if (!S.session) { S.view = 'login'; renderLogin(); return; }
     S.view = next;
@@ -195,6 +196,14 @@ document.addEventListener('click', e => { if (e.target.closest('[data-side]')) t
 document.addEventListener('keydown', e => {
   if (e.key === '\\' && !e.metaKey && !e.ctrlKey && !e.target.closest('input, select, textarea')) toggleSide();
 });
+
+// arrow keys move the camera on the live screen (set by renderLive, cleared on every route change)
+let liveKeys = null;
+const KEY_DIR = { ArrowUp: 'DirectionUp', ArrowDown: 'DirectionDown', ArrowLeft: 'DirectionLeft', ArrowRight: 'DirectionRight' };
+const keyOk = e => KEY_DIR[e.key] && liveKeys && !e.metaKey && !e.ctrlKey && !e.altKey && !e.target.closest('input, select, textarea, [contenteditable]') && !document.querySelector('.viewer');
+document.addEventListener('keydown', e => { if (keyOk(e)) { e.preventDefault(); if (!e.repeat) liveKeys.down(KEY_DIR[e.key]); } });
+document.addEventListener('keyup', e => { if (KEY_DIR[e.key] && liveKeys) liveKeys.up(KEY_DIR[e.key]); });
+window.addEventListener('blur', () => liveKeys?.stop());
 
 // ---------- cloud key + settings sync ----------
 
@@ -828,7 +837,7 @@ function viewLive() {
   const quality = store.get('quality', 'auto');
   const inv = store.get('invert', {})[d.sn] ?? 1;
   const wc = watchCfg();
-  const pad = `<div class="pad">
+  const pad = `<div class="pad" title="Tahan tombol, atau tahan panah ← ↑ → ↓ di keyboard (gerak paling pelan)">
       <span></span><button class="btn" data-dir="DirectionUp">${ic('up')}</button><span></span>
       <button class="btn" data-dir="DirectionLeft">${ic('left')}</button><span class="c">tahan</span><button class="btn" data-dir="DirectionRight">${ic('right')}</button>
       <button class="btn" data-dir="ZoomWide" title="Perkecil">${ic('minus')}</button><button class="btn" data-dir="DirectionDown">${ic('down')}</button><button class="btn" data-dir="ZoomTile" title="Perbesar">${ic('plus')}</button>
@@ -1005,6 +1014,24 @@ function viewLive() {
     b.addEventListener('pointerdown', down);
     b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up); b.addEventListener('lostpointercapture', up);
   });
+  // keyboard arrows: hold to move at the slowest speed (Step 1), release to stop
+  let keyDir = null, keyRaw = null, keyBtn = null;
+  liveKeys = {
+    down(dir) {
+      if (keyDir) this.stop();
+      keyRaw = dir; keyDir = mapDir(dir, invert);
+      keyBtn = document.querySelector(`.pad [data-dir="${dir}"]`); keyBtn?.classList.add('held');
+      player.watcher?.watcher.hold(60000);
+      api.ptzCommand(d, keyDir, 65535, { speed: 1 }).catch(handleErr);
+    },
+    up(dir) { if (dir === keyRaw) this.stop(); },
+    stop() {
+      if (!keyDir) return;
+      const dir = keyDir; keyDir = keyRaw = null; keyBtn?.classList.remove('held'); keyBtn = null;
+      setTimeout(() => api.ptzCommand(d, dir, -1, { speed: 1 }).catch(() => {}), 120);
+      player.watcher?.watcher.hold(2500);
+    },
+  };
 
   // Favourites (PTZ presets)
   const drawPresets = async () => {
@@ -1450,7 +1477,7 @@ if (new URLSearchParams(location.search).has('demo')) {
       if (!url) throw new Error('Demo: tidak ada siaran');
       return url;
     },
-    ptz: async () => {}, gotoPreset: async () => {},
+    ptz: async () => {}, ptzCommand: async () => {}, gotoPreset: async () => {},
     sensitivity: async () => ({ on: true, level: 6, latch: 0, human: 2, box: true, track: 2, tracking: false, preset: 'agresif' }),
     setSensitivity: async (d, k) => ({ on: true, level: SENS[k].level, latch: SENS[k].latch, human: SENS[k].human, box: SENS[k].box, track: SENS[k].track, tracking: false, preset: k }),
   });
