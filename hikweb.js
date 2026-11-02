@@ -8,6 +8,7 @@ export function installHik(x) {
 
   // ---------- relay connection ----------
 
+  store.raw('hikSlow', null);
   const R = { base: null, key: null, hello: null, err: null, devices: store.get('hikDevices', []), t: 0 };
   let finding = null;
 
@@ -80,6 +81,7 @@ export function installHik(x) {
     messages: (o) => req(`/api/messages?${qs(o)}`),
     records: (sn, ch, start, stop) => req(`/api/records?${qs({ sn, ch, start, stop })}`),
     status: () => req('/api/status'),
+    health: (sn, ch, q) => req(`/api/health?${qs({ sn, ch, q })}`, { timeout: 10000, retry: false }),
   };
 
   const dev = sn => R.devices.find(d => d.sn === sn);
@@ -130,28 +132,23 @@ export function installHik(x) {
       p.load();
     }
     /** HD only: the NVR's upload can be too small for the main stream (Klontong: ~1 Mbit/s for a 2.6 Mbit/s
-     *  stream). Video then arrives at half speed and the cloud skips ~9 s every ~20 s, so it can never play
-     *  smoothly. Measured as buffered video gained per second over 12 s; below 0.75× → opts.onSlow (→ SD). */
+     *  stream) — the cloud then skips ~9 s every ~20 s and it can never play smoothly. The relay sees that as
+     *  RTP packet loss and reports slow in /api/health → opts.onSlow (→ SD). Channels without SD never switch. */
     watch(gen) {
       super.watch(gen);
       clearInterval(this.speedT);
-      if (this.stream !== '0' || !this.opts.onSlow) return;
-      const pts = [];
-      this.speedT = setInterval(() => {
-        const v = this.video;
-        if (gen !== this.gen || document.hidden || !v.buffered.length) { pts.length = 0; return; }
-        pts.push([performance.now(), v.buffered.end(v.buffered.length - 1)]);
-        while (pts.length && pts.at(-1)[0] - pts[0][0] > 12e3) pts.shift();
-        if (pts.length < 11) return;
-        const [t0, b0] = pts[0], [t1, b1] = pts.at(-1);
-        this.speed = (b1 - b0) / ((t1 - t0) / 1000);
-        if (this.speed < 0.75) this.slow('speed');
-      }, 1000);
+      if (this.stream !== '0' || !this.opts.onSlow || this.noSub) return;
+      this.speedT = setInterval(async () => {
+        if (gen !== this.gen || document.hidden) return;
+        const h = await api.health(this.hsn, this.hch, 'main').catch(() => null);
+        if (gen === this.gen && h?.slow) this.slow('loss');
+      }, 5000);
     }
+    get noSub() { return !!dev(this.hsn)?.channels.find(c => c.ch === this.hch)?.noSub || this.info?.q === 'main' && this.stream === '1'; }
     slow(why) {
-      if (this.stopped || this.stream !== '0' || !this.opts.onSlow) return false;
+      if (this.stopped || this.stream !== '0' || !this.opts.onSlow || this.noSub) return false;
       clearInterval(this.speedT);
-      this.opts.onSlow(why, this.speed);
+      this.opts.onSlow(why);
       return true;
     }
     teardown() { clearInterval(this.speedT); super.teardown(); }
@@ -250,8 +247,8 @@ export function installHik(x) {
     const d = dev(sn);
     if (!d) return go('hik');
     const cams = d.channels, idx = cams.findIndex(c => c.ch === ch);
-    // NVRs whose upload was too slow for HD start in SD for 12 h (store hikSlow: sn → time), unless HD is picked by hand
-    const slowMap = store.get('hikSlow', {}), slowNvr = Date.now() - (slowMap[sn] || 0) < 12 * 3600e3;
+    // NVRs whose upload was too slow for HD start in SD for 12 h (store hikSlow2: sn → time; old hikSlow held wrong marks), unless HD is picked by hand
+    const slowMap = store.get('hikSlow2', {}), slowNvr = Date.now() - (slowMap[sn] || 0) < 12 * 3600e3;
     let q0 = store.get('hikQuality', 'sub'), autoSD = false;
     if (q0 === 'main' && slowNvr) { q0 = 'sub'; autoSD = true; }
     const pad = `<div class="pad">
@@ -312,7 +309,7 @@ export function installHik(x) {
     let player;
     const label = () => {
       const i = player.info || {};
-      $('#lb').innerHTML = `<i class="dot online"></i><span>LIVE · ${player.stream === '0' ? 'HD' : 'SD'}${i.codec ? ` · ${i.codec === 'hevc' ? 'H.265' : 'H.264'}` : ''}${player.lag != null ? ` · jeda ${player.lag.toFixed(1)} dtk` : ''}</span>`;
+      $('#lb').innerHTML = `<i class="dot online"></i><span>LIVE · ${(i.q || (player.stream === '0' ? 'main' : 'sub')) === 'main' ? (player.stream === '1' ? 'HD (kamera tanpa SD)' : 'HD') : 'SD'}${i.codec ? ` · ${i.codec === 'hevc' ? 'H.265' : 'H.264'}` : ''}${player.lag != null ? ` · jeda ${player.lag.toFixed(1)} dtk` : ''}</span>`;
     };
     const keyForm = msg => {
       setMsg(null, false, `<div class="hkey">${ic('light')}<b>${esc(msg)}</b>
@@ -327,7 +324,7 @@ export function installHik(x) {
       player = new HikPlayer(video, sn, ch, {
         stream,
         onSlow: manualHD ? null : () => {
-          const m = store.get('hikSlow', {}); m[sn] = Date.now(); store.set('hikSlow', m);
+          const m = store.get('hikSlow2', {}); m[sn] = Date.now(); store.set('hikSlow2', m);
           toast('Internet di lokasi NVR terlalu lambat untuk HD — beralih ke SD agar lancar');
           $('#q').value = 'sub'; $('#autosd').hidden = false;
           start('1');
@@ -352,7 +349,7 @@ export function installHik(x) {
       const hd = e.target.value === 'main';
       store.set('hikQuality', e.target.value); $('#autosd').hidden = true;
       // HD picked by hand on a slow NVR: respect it for this view (no auto switch), forget the slow mark
-      if (hd && (autoSD || slowNvr || store.get('hikSlow', {})[sn])) { manualHD = true; const m = store.get('hikSlow', {}); delete m[sn]; store.set('hikSlow', m); }
+      if (hd && (autoSD || slowNvr || store.get('hikSlow2', {})[sn])) { manualHD = true; const m = store.get('hikSlow2', {}); delete m[sn]; store.set('hikSlow2', m); }
       start(hd ? '0' : '1');
     };
     $('#fill').onclick = () => { stage.classList.toggle('fill'); $('#fill').classList.toggle('on'); };
@@ -432,8 +429,8 @@ export function installHik(x) {
       const { sn, ch } = parseId(t.dataset.hid), dot = t.querySelector('.dot');
       t.onclick = () => go('hiklive', t.dataset.hid);
       const p = new HikPlayer(t.querySelector('video'), sn, ch, {
-        stream: n === 1 && !(Date.now() - (store.get('hikSlow', {})[sn] || 0) < 12 * 3600e3) ? '0' : '1',
-        onSlow: () => { const m = store.get('hikSlow', {}); m[sn] = Date.now(); store.set('hikSlow', m); p.stream = '1'; p.start(); },
+        stream: n === 1 && !(Date.now() - (store.get('hikSlow2', {})[sn] || 0) < 12 * 3600e3) ? '0' : '1',
+        onSlow: () => { const m = store.get('hikSlow2', {}); m[sn] = Date.now(); store.set('hikSlow2', m); p.stream = '1'; p.start(); },
         onState: (s, v) => {
           if (s === 'off' || s === 'key') t.insertAdjacentHTML('beforeend', `<div class="tlock">${ic(s === 'key' ? 'lock' : 'cam')}<span>${esc(s === 'key' ? `Terkunci · isi kode ${dev(sn)?.name || ''} di Saya` : v)}</span></div>`);
           dot.className = 'dot ' + (s === 'play' || s === 'tick' ? 'online' : s === 'retry' || s === 'key' || s === 'off' ? 'offline' : 'sleeping');
