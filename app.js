@@ -703,7 +703,8 @@ async function cloudSave(cap, kind, blob, mime, secs) {
       catch (e) { console.warn('drive', e); }
     }
     if (!path) { path = await cs.path(cap.sn, name); await cs.upload(path, blob, mime); }
-    const ev = { sn: cap.sn, cam: cap.cam, event: cap.person ? 'HumanDetect' : 'VideoMotion', alarm_id: cap.id, at: cap.at.toISOString(), bytes: blob.size, [kind]: path };
+    // bytes = what sits in Supabase (the Mac's rolling limit counts it); Drive usage comes from Drive itself
+    const ev = { sn: cap.sn, cam: cap.cam, event: cap.person ? 'HumanDetect' : 'VideoMotion', alarm_id: cap.id, at: cap.at.toISOString(), bytes: isGdPath(path) ? 0 : blob.size, [kind]: path };
     if (secs) ev.secs = secs;
     await cs.put(ev);
     cap.cloud = true;
