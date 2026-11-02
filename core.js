@@ -449,9 +449,18 @@ export const CLOUD = {
   supaQuota: 943718400,
 };
 export const isB2Path = p => typeof p === 'string' && p.split('/')[1] === 'b2';
+// Klip videos in Google Drive (2026-11-02): row path <owner>/gd/<Drive file id>; photos stay in Supabase.
+export const isGdPath = p => typeof p === 'string' && p.split('/')[1] === 'gd';
+export const GDRIVE = {
+  fn: 'https://bbptcxpzzvgpxqylkrmw.supabase.co/functions/v1/pantau-drive', // pantau/drive/supabase/functions/pantau-drive
+  quota: 5 * 2 ** 30, // rolling limit for the videos in the Drive folder "Pantau Klip"
+  reserve: 32 * 2 ** 20,
+};
 
 export class CloudStore {
   constructor(key) { this.key = key; }
+  /** One Drive client per cloud key, shared by every CloudStore made for it (token + usage caches). */
+  get drive() { return drives.get(this.key) || drives.set(this.key, new DriveStore(this.key)).get(this.key); }
   static isValidKey(k) { return /^[0-9a-f]{64}$/.test(k || ''); }
 
   headers(extra = {}) {
@@ -485,6 +494,7 @@ export class CloudStore {
   }
 
   async signedURLs(paths, expires = 3600) {
+    paths = paths.filter(p => !isGdPath(p));
     if (!paths.length) return {};
     if (!CLOUD.b2) paths = paths.filter(p => !isB2Path(p));
     if (!paths.length) return {};
@@ -539,6 +549,9 @@ export class CloudStore {
   }
 
   async removePaths(prefixes) {
+    const gd = prefixes.filter(isGdPath);
+    if (gd.length) await this.drive.remove(gd.map(p => p.split('/')[2]));
+    prefixes = prefixes.filter(p => !isGdPath(p));
     const b2 = prefixes.filter(isB2Path);
     if (b2.length && CLOUD.b2) await this.b2('/del', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: b2 }) });
     prefixes = prefixes.filter(p => !isB2Path(p));
@@ -587,5 +600,129 @@ export class CloudStore {
     const paths = j.paths || [];
     if (paths.length) await this.removePaths(paths);
     return paths.length;
+  }
+}
+
+// ---------- Google Drive (Klip Gerak videos) ----------
+
+const drives = new Map();
+
+/** Videos in the "Pantau Klip" folder of the connected Google Drive. The Edge Function pantau-drive keeps the
+ *  refresh token and hands out 1-hour access tokens for the cloud key, so no device needs a Google login. */
+export class DriveStore {
+  constructor(key) { this.key = key; this.tok = null; this.state = null; this.usage = null; }
+
+  async fn(route, body = {}) {
+    const r = await fetch(GDRIVE.fn + route, {
+      method: 'POST', headers: { 'x-pantau-key': this.key, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new JFError(r.status, j.error === 'belum' ? 'Google Drive belum disambungkan' : `Drive ${r.status}: ${j.error || 'gagal'}`);
+    return j;
+  }
+
+  /** {connected, email}; cached for 5 min (null = unknown / no answer). */
+  async status(fresh = false) {
+    if (!fresh && this.state && Date.now() - this.state.at < 300000) return this.state;
+    try { this.state = { ...(await this.fn('/status')), at: Date.now() }; }
+    catch { if (!this.state) return { connected: false, email: '', error: true }; }
+    return this.state;
+  }
+  async connected() { return (await this.status()).connected; }
+
+  /** Google consent page; it comes back to `back` with ?drive=ok (or ?drive=<error>). */
+  async startURL(back) { return (await this.fn('/start', { back })).url; }
+  async disconnect() { await this.fn('/off'); this.tok = null; this.usage = null; this.state = { connected: false, email: '', at: Date.now() }; }
+
+  async token() {
+    if (this.tok && this.tok.exp > Date.now()) return this.tok;
+    this.tokP ||= this.fn('/token').then(t => (this.tok = t)).catch(e => {
+      if (e.code === 404) this.state = { connected: false, email: '', at: Date.now() };
+      throw e;
+    }).finally(() => { this.tokP = null; });
+    return this.tokP;
+  }
+
+  async api(url, init = {}) {
+    const t = await this.token();
+    const r = await fetch(url, { ...init, headers: { Authorization: `Bearer ${t.token}`, ...(init.headers || {}) } });
+    if (r.status === 401) this.tok = null;
+    if (!r.ok && !(init.method === 'DELETE' && r.status === 404)) {
+      const j = await r.json().catch(() => null);
+      throw new JFError(r.status, `Drive ${r.status}: ${j?.error?.message || 'gagal'}`);
+    }
+    return r;
+  }
+
+  /** Bytes used by the folder + size of each file (cached 10 min; uploads / deletes keep it current). */
+  async used(fresh = false) {
+    if (!fresh && this.usage && Date.now() - this.usage.at < 600000) return this.usage;
+    const { folder } = await this.token(), sizes = new Map();
+    let page = '';
+    do {
+      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false`, fields: 'nextPageToken,files(id,size)', pageSize: '1000', ...(page ? { pageToken: page } : {}) });
+      const j = await (await this.api(`https://www.googleapis.com/drive/v3/files?${q}`)).json();
+      for (const f of j.files || []) sizes.set(f.id, +f.size || 0);
+      page = j.nextPageToken || '';
+    } while (page);
+    let bytes = 0;
+    for (const v of sizes.values()) bytes += v;
+    return (this.usage = { bytes, sizes, at: Date.now() });
+  }
+
+  /** Uploads one file into the folder → Drive file id. */
+  async upload(name, blob, mime) {
+    const { folder } = await this.token();
+    const b = 'pantau' + Math.random().toString(36).slice(2);
+    const body = new Blob([
+      `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: [folder], mimeType: mime })}\r\n`,
+      `--${b}\r\nContent-Type: ${mime}\r\n\r\n`, blob, `\r\n--${b}--`]);
+    const r = await this.api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,size', {
+      method: 'POST', body, headers: { 'Content-Type': `multipart/related; boundary=${b}` },
+    });
+    const f = await r.json();
+    if (this.usage) { this.usage.sizes.set(f.id, +f.size || blob.size); this.usage.bytes += +f.size || blob.size; }
+    return f.id;
+  }
+
+  async blob(id) { return (await this.api(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).blob(); }
+
+  async remove(ids) {
+    for (const id of ids) {
+      await this.api(`https://www.googleapis.com/drive/v3/files/${id}`, { method: 'DELETE' });
+      if (this.usage?.sizes.has(id)) { this.usage.bytes -= this.usage.sizes.get(id); this.usage.sizes.delete(id); }
+    }
+  }
+
+  /** Rolling storage: deletes the OLDEST Klip events that have a Drive video until `incoming` more bytes fit in
+   *  GDRIVE.quota. Returns how many events were removed. */
+  async makeRoom(cs, incoming) {
+    const u = await this.used();
+    const room = GDRIVE.quota - GDRIVE.reserve;
+    if (u.bytes + incoming <= room) return 0;
+    const rows = [];
+    for (let before = null; ;) {
+      const page = await cs.list({ before, limit: 500 });
+      rows.push(...page.rows);
+      if (page.rows.length < 500) break;
+      before = page.rows[page.rows.length - 1].at;
+    }
+    rows.sort((a, b) => new Date(a.at) - new Date(b.at));
+    let left = u.bytes;
+    const ids = [];
+    for (const r of rows) {
+      if (left + incoming <= room) break;
+      if (!isGdPath(r.video)) continue;
+      ids.push(r.id);
+      left -= u.sizes.get(r.video.split('/')[2]) || 0;
+    }
+    if (ids.length) await cs.remove(ids);
+    return ids.length;
+  }
+
+  /** Stores a clip video: room first, then the upload → row path <owner>/gd/<id>. */
+  async put(cs, name, blob, mime) {
+    await this.makeRoom(cs, blob.size);
+    return `${await cs.owner()}/gd/${await this.upload(name, blob, mime)}`;
   }
 }

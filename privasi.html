@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privasi Pantau CCTV</title>
+<style>
+:root { --bg: #eef2f7; --ink: #0d1520; --ink2: #4a5668; --card: #fff; color-scheme: light; }
+@media (prefers-color-scheme: dark) { :root { --bg: #070b12; --ink: #eef3fa; --ink2: #a8b3c4; --card: #121a28; color-scheme: dark; } }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 16px 48px; }
+section { background: var(--card); border-radius: 16px; padding: 4px 20px 12px; margin-top: 16px; }
+h1 { font-size: 26px; margin: 0; }
+h2 { font-size: 18px; margin: 18px 0 6px; }
+p, li { color: var(--ink2); }
+a { color: #0a84ff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Kebijakan Privasi Pantau CCTV</h1>
+  <p>Berlaku untuk situs <a href="./">liemyo.github.io/cctv</a> dan aplikasi Pantau di Mac. Diperbarui 2 November 2026.</p>
+  <section>
+    <h2>Data yang dipakai</h2>
+    <ul>
+      <li>Akun iCSee / XMeye Anda dipakai langsung dari browser ke server iCSee untuk menampilkan kamera. Kata sandi tidak dikirim ke server kami.</li>
+      <li>Klip Gerak (foto dan video saat ada gerakan) disimpan privat di cloud Pantau (Supabase), hanya bisa dibuka dengan kunci cloud milik Anda.</li>
+    </ul>
+    <h2>Google Drive</h2>
+    <ul>
+      <li>Bila Anda menyambungkan Google Drive, Pantau meminta izin <b>drive.file</b>: hanya file yang dibuat Pantau sendiri (folder "Pantau Klip"). Pantau tidak bisa melihat file Drive Anda yang lain.</li>
+      <li>Pantau juga membaca alamat email akun Google untuk ditampilkan sebagai akun yang tersambung.</li>
+      <li>Token Google disimpan terenkripsi di server Pantau dan hanya dipakai untuk mengunggah, memutar, dan menghapus video klip di folder tersebut. Data tidak dijual atau dibagikan ke pihak lain.</li>
+      <li>Putuskan kapan saja di menu Saya › Klip Gerak, atau di <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</li>
+    </ul>
+    <h2>Kontak</h2>
+    <p>yulius.krisnawan@gmail.com</p>
+  </section>
+</main>
+</body>
+</html>

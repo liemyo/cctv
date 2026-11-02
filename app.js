@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS } from './core.js?v=8';
-import { installHik } from './hikweb.js?v=8';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=9';
+import { installHik } from './hikweb.js?v=9';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=7';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
@@ -695,8 +695,14 @@ async function cloudSave(cap, kind, blob, mime, secs) {
   const cs = cloud();
   if (!cs) return;
   try {
-    const path = await cs.path(cap.sn, `${cap.id}.${kind === 'video' ? 'mp4' : 'jpg'}`);
-    await cs.upload(path, blob, mime);
+    const name = `${cap.id}.${kind === 'video' ? 'mp4' : 'jpg'}`;
+    // videos go to Google Drive when it is connected (photos stay in Supabase); a failed Drive upload falls back
+    let path = null;
+    if (kind === 'video' && await cs.drive.connected()) {
+      try { path = await cs.drive.put(cs, `${cap.cam || cap.sn} ${fileStamp(cap.at)} ${name}`, blob, mime); }
+      catch (e) { console.warn('drive', e); }
+    }
+    if (!path) { path = await cs.path(cap.sn, name); await cs.upload(path, blob, mime); }
     const ev = { sn: cap.sn, cam: cap.cam, event: cap.person ? 'HumanDetect' : 'VideoMotion', alarm_id: cap.id, at: cap.at.toISOString(), bytes: blob.size, [kind]: path };
     if (secs) ev.secs = secs;
     await cs.put(ev);
@@ -1336,7 +1342,7 @@ async function viewKlip() {
     return;
   }
   const cs = new CloudStore(key);
-  let rows = [], used = 0, quota = 0, count = 0, thumbs = {}, filter = store.get('klipCam', 'all');
+  let rows = [], used = 0, quota = 0, count = 0, thumbs = {}, drive = null, filter = store.get('klipCam', 'all');
   const draw = () => {
     const list = rows.filter(r => filter === 'all' || r.sn === filter);
     let html = '', lastDay = '';
@@ -1351,7 +1357,7 @@ async function viewKlip() {
     if (lastDay) html += '</div>';
     $('#out').innerHTML = list.length ? html + (rows.length < count ? '<div class="row" style="justify-content:center;margin-top:16px"><button class="btn" id="more">Muat lagi</button></div>' : '')
       : '<div class="empty glass">Belum ada klip.</div>';
-    $('#usage').textContent = `${count} kejadian · ${fmtBytes(used)} dari ${fmtBytes(quota)}`;
+    $('#usage').textContent = `${count} kejadian · ${drive ? `Drive ${fmtBytes(drive.bytes)} dari ${fmtBytes(GDRIVE.quota)} · foto ` : ''}${fmtBytes(used)} dari ${fmtBytes(quota)}`;
     main.querySelectorAll('.ev').forEach(b => b.onclick = () => {
       const items = list.map(r => ({
         video: !!r.video, poster: thumbs[r.alarm_photo || r.photo],
@@ -1360,6 +1366,7 @@ async function viewKlip() {
         resolve: async () => {
           const p = r.video || r.photo || r.alarm_photo;
           if (!p) return null;
+          if (isGdPath(p)) return thumbs[p] ||= URL.createObjectURL(await cs.drive.blob(p.split('/')[2]));
           return thumbs[p] || (await cs.signedURLs([p]))[p] || null;
         },
       }));
@@ -1371,7 +1378,11 @@ async function viewKlip() {
     try {
       const page = await cs.list({ before, limit: 120 });
       rows = before ? rows.concat(page.rows) : page.rows;
-      if (!before) { used = page.used; quota = page.quota; } count = page.count;
+      if (!before) {
+        used = page.used; quota = page.quota;
+        cs.drive.connected().then(on => on && cs.drive.used(true)).then(u => { drive = u || null; if (S.view === 'klip' && u) draw(); }).catch(() => {});
+      }
+      count = page.count;
       const paths = [...new Set(page.rows.map(r => r.alarm_photo || r.photo).filter(Boolean))];
       draw();
       for (let i = 0; i < paths.length; i += 100) Object.assign(thumbs, await cs.signedURLs(paths.slice(i, i + 100)));
@@ -1430,7 +1441,8 @@ function viewSaya() {
         <h3>Klip Gerak (cloud)</h3>
         ${CloudStore.isValidKey(key) ? `<div class="row"><code class="k">${key.slice(0, 8)}••••••••${key.slice(-4)}</code><span class="spacer"></span>
           <button class="btn danger" id="ck">Putuskan</button></div>
-          <div class="muted small">Semua setelan di situs ini tersimpan otomatis ke cloud dan ikut di browser / perangkat lain${prefsState === 'err' ? ' — <b style="color:var(--warn)">gagal sinkron, dicoba lagi saat ada perubahan</b>' : ''}.</div>`
+          <div class="muted small">Semua setelan di situs ini tersimpan otomatis ke cloud dan ikut di browser / perangkat lain${prefsState === 'err' ? ' — <b style="color:var(--warn)">gagal sinkron, dicoba lagi saat ada perubahan</b>' : ''}.</div>
+          <div class="row" id="gd"><span class="muted small">Google Drive: memeriksa…</span></div>`
           : '<div class="muted small">Belum terhubung — buka tab Klip Gerak.</div>'}
       </div>
       ${HIK.sayaCard()}
@@ -1448,7 +1460,34 @@ function viewSaya() {
   document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { store.set('theme', b.dataset.t); applyTheme(); route(); });
   document.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { store.set('mode', b.dataset.m); route(); });
   $('#ck') && ($('#ck').onclick = () => { store.raw('cloudKey', null); store.raw('cloudOff', true); route(); });
+  $('#gd') && driveCard($('#gd'));
   HIK.sayaBind();
+}
+
+/** Google Drive row of the Klip Gerak card: videos of new clips go to the "Pantau Klip" folder (GDRIVE.quota, rolling). */
+async function driveCard(box) {
+  const cs = cloud();
+  if (!cs) return;
+  const st = await cs.drive.status(true);
+  if (!box.isConnected) return;
+  box.outerHTML = `<div id="gd" style="display:grid;gap:8px">
+    <div class="row"><div><b>Google Drive</b><div class="muted small">${st.connected
+      ? `Tersambung · ${esc(st.email || 'akun Google')} — video klip baru disimpan di folder <b>Pantau Klip</b>, maks ${fmtBytes(GDRIVE.quota)} (yang terlama dihapus otomatis). Foto tetap di cloud Pantau.`
+      : st.error ? 'Tidak bisa memeriksa sambungan Google Drive (internet?).'
+      : `Belum tersambung — video klip disimpan di cloud Pantau (900 MB). Sambungkan untuk menyimpan video di Google Drive (maks ${fmtBytes(GDRIVE.quota)}).`}</div></div>
+      <span class="spacer"></span>${st.connected ? '<button class="btn danger" id="gdoff">Putuskan</button>' : st.error ? '' : '<button class="btn primary" id="gdon">Sambungkan</button>'}</div>
+    ${st.connected ? '<div class="muted small" id="gdu"></div>' : ''}</div>`;
+  $('#gdon') && ($('#gdon').onclick = async e => {
+    e.target.disabled = true;
+    try { location.href = await cs.drive.startURL(location.origin + location.pathname); }
+    catch (err) { e.target.disabled = false; toast(err.message); }
+  });
+  $('#gdoff') && ($('#gdoff').onclick = async () => {
+    if (!confirm('Putuskan Google Drive? Video yang sudah ada di Drive tidak bisa diputar dari sini sampai disambungkan lagi.')) return;
+    try { await cs.drive.disconnect(); route(); } catch (err) { toast(err.message); }
+  });
+  if (st.connected) cs.drive.used(true).then(u => { const el = $('#gdu'); if (el) el.textContent = `Terpakai ${fmtBytes(u.bytes)} dari ${fmtBytes(GDRIVE.quota)} · ${u.sizes.size} video`; })
+    .catch(err => { const el = $('#gdu'); if (el) el.textContent = err.message; });
 }
 
 // ---------- demo (?demo=1): sample data, never touches the saved session ----------
@@ -1494,5 +1533,13 @@ const HIK = installHik(hikCtx);
 
 window.__pantau = { S, api: () => api, LivePlayer, players, hevcMSE, ensureCloudKey, prefsSync, store };
 if ('serviceWorker' in navigator) navigator.serviceWorker.getRegistrations?.().then(r => r.forEach(x => x.unregister())).catch(() => {});
+// back from the Google consent page (pantau-drive /cb): ?drive=ok | <error>
+{
+  const r = new URLSearchParams(location.search).get('drive');
+  if (r) {
+    history.replaceState(null, '', location.pathname + '#saya');
+    setTimeout(() => toast(r === 'ok' ? 'Google Drive tersambung — video klip baru disimpan di Drive' : `Google Drive gagal disambungkan (${r})`, 5000), 600);
+  }
+}
 route();
 if (S.session && S.session.token !== 'demo') cloudReady();

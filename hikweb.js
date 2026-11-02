@@ -1,7 +1,7 @@
 // Hik-Connect part of the site (own menu, separate from iCSee). Hik-Connect's cloud has no browser API,
 // so everything goes through the small relay on the Mac (hik-relay/), reached over a Cloudflare quick tunnel.
 // The relay's address sits in the CCTV cloud folder; the access key is derived from the Klip Gerak key.
-import { sha256Hex } from './core.js?v=8';
+import { sha256Hex } from './core.js?v=9';
 
 export function installHik(x) {
   const { $, esc, ic, topbar, store, toast, go, route, LivePlayer, within, fileStamp, saveBlob, openViewer, dayLabel, timeLabel, S, cloud, ensureCloudKey } = x;
