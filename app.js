@@ -1492,7 +1492,7 @@ async function driveCard(box) {
     if (!confirm('Putuskan Google Drive? Video yang sudah ada di Drive tidak bisa diputar dari sini sampai disambungkan lagi.')) return;
     try { await cs.drive.disconnect(); route(); } catch (err) { toast(err.message); }
   });
-  if (st.connected) cs.drive.used(true).then(u => { const el = $('#gdu'); if (el) el.textContent = `Terpakai ${fmtBytes(u.bytes)} dari ${fmtBytes(GDRIVE.quota)} · ${u.sizes.size} video`; })
+  if (st.connected) cs.drive.used(true).then(u => { const el = $('#gdu'); if (el) el.textContent = `Terpakai ${fmtBytes(u.bytes)} dari ${fmtBytes(GDRIVE.quota)} · ${u.sizes.size} file`; })
     .catch(err => { const el = $('#gdu'); if (el) el.textContent = err.message; });
 }
 
