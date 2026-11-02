@@ -197,12 +197,14 @@ document.addEventListener('keydown', e => {
   if (e.key === '\\' && !e.metaKey && !e.ctrlKey && !e.target.closest('input, select, textarea')) toggleSide();
 });
 
-// arrow keys move the camera on the live screen (set by renderLive, cleared on every route change)
+// arrow keys and W A S D move the camera on the live screen (set by renderLive, cleared on every route change)
 let liveKeys = null;
-const KEY_DIR = { ArrowUp: 'DirectionUp', ArrowDown: 'DirectionDown', ArrowLeft: 'DirectionLeft', ArrowRight: 'DirectionRight' };
-const keyOk = e => KEY_DIR[e.key] && liveKeys && !e.metaKey && !e.ctrlKey && !e.altKey && !e.target.closest('input, select, textarea, [contenteditable]') && !document.querySelector('.viewer');
-document.addEventListener('keydown', e => { if (keyOk(e)) { e.preventDefault(); if (!e.repeat) liveKeys.down(KEY_DIR[e.key]); } });
-document.addEventListener('keyup', e => { if (KEY_DIR[e.key] && liveKeys) liveKeys.up(KEY_DIR[e.key]); });
+const KEY_DIR = { ArrowUp: 'DirectionUp', ArrowDown: 'DirectionDown', ArrowLeft: 'DirectionLeft', ArrowRight: 'DirectionRight',
+  KeyW: 'DirectionUp', KeyS: 'DirectionDown', KeyA: 'DirectionLeft', KeyD: 'DirectionRight' };
+const keyDirOf = e => KEY_DIR[e.key] || KEY_DIR[e.code];
+const keyOk = e => keyDirOf(e) && liveKeys && !e.metaKey && !e.ctrlKey && !e.altKey && !e.target.closest('input, select, textarea, [contenteditable]') && !document.querySelector('.viewer');
+document.addEventListener('keydown', e => { if (keyOk(e)) { e.preventDefault(); if (!e.repeat) liveKeys.down(keyDirOf(e)); } });
+document.addEventListener('keyup', e => { if (keyDirOf(e) && liveKeys) liveKeys.up(keyDirOf(e)); });
 window.addEventListener('blur', () => liveKeys?.stop());
 
 // ---------- cloud key + settings sync ----------
@@ -844,7 +846,7 @@ function viewLive() {
   const quality = store.get('quality', 'auto');
   const inv = store.get('invert', {})[d.sn] ?? 1;
   const wc = watchCfg();
-  const pad = `<div class="pad" title="Tahan tombol, atau tahan panah ← ↑ → ↓ di keyboard (gerak paling pelan)">
+  const pad = `<div class="pad" title="Tahan tombol, atau tahan panah ← ↑ → ↓ / W A S D di keyboard (gerak paling pelan)">
       <span></span><button class="btn" data-dir="DirectionUp">${ic('up')}</button><span></span>
       <button class="btn" data-dir="DirectionLeft">${ic('left')}</button><span class="c">tahan</span><button class="btn" data-dir="DirectionRight">${ic('right')}</button>
       <button class="btn" data-dir="ZoomWide" title="Perkecil">${ic('minus')}</button><button class="btn" data-dir="DirectionDown">${ic('down')}</button><button class="btn" data-dir="ZoomTile" title="Perbesar">${ic('plus')}</button>
@@ -1021,7 +1023,7 @@ function viewLive() {
     b.addEventListener('pointerdown', down);
     b.addEventListener('pointerup', up); b.addEventListener('pointercancel', up); b.addEventListener('lostpointercapture', up);
   });
-  // keyboard arrows: hold to move at the slowest speed (Step 1), release to stop
+  // keyboard arrows / W A S D: hold to move at the slowest speed (Step 1), release to stop
   let keyDir = null, keyRaw = null, keyBtn = null;
   liveKeys = {
     down(dir) {
