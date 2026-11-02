@@ -484,8 +484,10 @@ export class CloudStore {
     return j;
   }
 
-  /** used = Supabase + B2 bytes; quota = B2 quota when B2 is on (older Supabase files count against it). */
+  /** Klip events, newest first. With Google Drive connected they live there (DriveStore events; used = 0 Supabase
+   *  bytes); else in Supabase: used = Supabase + B2 bytes, quota = B2 quota when B2 is on. */
   async list({ before = null, limit = 120, sn = null } = {}) {
+    if (await this.drive.connected()) return this.drive.events(this, { before, limit, sn });
     const args = { p_limit: limit };
     if (before) args.p_before = before;
     if (sn) args.p_sn = sn;
@@ -595,10 +597,15 @@ export class CloudStore {
     if (!r.ok && r.status !== 409) throw new JFError(r.status, `Cloud ${r.status}`);
   }
 
-  /** Insert / merge one event row (same alarm_id merges photo, video and secs). */
-  async put(ev) { return (await this.rpc('pantau_put', { p_ev: ev })).id; }
+  /** Insert / merge one event (same sn + alarm_id merges photo, video and secs). */
+  async put(ev) {
+    if (await this.drive.connected()) return this.drive.putEvent(this, ev);
+    return (await this.rpc('pantau_put', { p_ev: ev })).id;
+  }
 
+  /** Deletes events and their files; returns how many files went. */
   async remove(ids) {
+    if (await this.drive.connected()) return this.drive.removeEvents(this, ids);
     const j = await this.rpc('pantau_del', { p_ids: ids });
     const paths = j.paths || [];
     if (paths.length) await this.removePaths(paths);
@@ -661,25 +668,29 @@ export class DriveStore {
    *  Thumbnail links (lh3.googleusercontent.com, valid for hours) open without a token, so they work as <img src>. */
   async used(fresh = false) {
     if (!fresh && this.usage && Date.now() - this.usage.at < 600000) return this.usage;
-    const { folder } = await this.token(), sizes = new Map(), thumbs = new Map();
+    const { folder } = await this.token(), sizes = new Map(), thumbs = new Map(), events = new Map();
     let page = '';
     do {
-      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false`, fields: 'nextPageToken,files(id,size,thumbnailLink)', pageSize: '1000', ...(page ? { pageToken: page } : {}) });
+      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false`, fields: 'nextPageToken,files(id,size,thumbnailLink,appProperties)', pageSize: '1000', ...(page ? { pageToken: page } : {}) });
       const j = await (await this.api(`https://www.googleapis.com/drive/v3/files?${q}`)).json();
-      for (const f of j.files || []) { sizes.set(f.id, +f.size || 0); if (f.thumbnailLink) thumbs.set(f.id, f.thumbnailLink); }
+      for (const f of j.files || []) {
+        sizes.set(f.id, +f.size || 0);
+        if (f.thumbnailLink) thumbs.set(f.id, f.thumbnailLink);
+        if (f.appProperties?.k === 'ev') events.set(f.id, f.appProperties);
+      }
       page = j.nextPageToken || '';
     } while (page);
     let bytes = 0;
     for (const v of sizes.values()) bytes += v;
-    return (this.usage = { bytes, sizes, thumbs, at: Date.now() });
+    return (this.usage = { bytes, sizes, thumbs, events, at: Date.now() });
   }
 
   /** Uploads one file into the folder → Drive file id. */
-  async upload(name, blob, mime) {
+  async upload(name, blob, mime, meta = {}) {
     const { folder } = await this.token();
     const b = 'pantau' + Math.random().toString(36).slice(2);
     const body = new Blob([
-      `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: [folder], mimeType: mime })}\r\n`,
+      `--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name, parents: [folder], mimeType: mime, ...meta })}\r\n`,
       `--${b}\r\nContent-Type: ${mime}\r\n\r\n`, blob, `\r\n--${b}--`]);
     const r = await this.api('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,size', {
       method: 'POST', body, headers: { 'Content-Type': `multipart/related; boundary=${b}` },
@@ -701,7 +712,7 @@ export class DriveStore {
   /** Picture URLs for row paths (<owner>/gd/<id>): Drive's thumbnail (size px), else — for photos, not for videos
    *  (`videos`) — the file itself (Drive makes thumbnails a little after the upload). */
   async thumbURLs(paths, { size = 400, videos = new Set() } = {}) {
-    const out = {}, u = await this.used(true);
+    const out = {}, u = await this.used(); // events() just refreshed the listing
     await Promise.all(paths.map(async p => {
       const id = p.split('/')[2], t = u.thumbs.get(id);
       out[p] = t ? t.replace(/=s\d+$/, '') + `=s${size}` : videos.has(p) ? null : await this.objectURL(id).catch(() => null);
@@ -748,14 +759,7 @@ export class DriveStore {
     const u = await this.used();
     const room = GDRIVE.quota - GDRIVE.reserve;
     if (u.bytes + incoming <= room) return 0;
-    const rows = [];
-    for (let before = null; ;) {
-      const page = await cs.list({ before, limit: 500 });
-      rows.push(...page.rows);
-      if (page.rows.length < 500) break;
-      before = page.rows[page.rows.length - 1].at;
-    }
-    rows.sort((a, b) => new Date(a.at) - new Date(b.at));
+    const rows = this.rows(await cs.owner()).reverse(); // oldest first
     let left = u.bytes;
     const ids = [];
     for (const r of rows) {
@@ -765,8 +769,89 @@ export class DriveStore {
       ids.push(r.id);
       for (const p of files) left -= u.sizes.get(p.split('/')[2]) || 0;
     }
-    if (ids.length) await cs.remove(ids);
+    if (ids.length) await this.removeEvents(cs, ids);
     return ids.length;
+  }
+
+  // ---- Klip events ----
+  // One empty marker file per event, named "ev <cam> <time>", carrying the event in appProperties (key+value ≤ 124
+  // bytes each): k='ev', sn, c (camera), e (event), a (alarm id), t (ISO time), s (seconds), and the files v / p / ap
+  // (video, live photo, camera alarm photo) as Drive ids — or "/<sn>/<name>" for a file that fell back to Supabase.
+  // The folder listing (used) brings every marker along, so listing, counting and rolling need no extra requests.
+
+  static PROPS = { video: 'v', photo: 'p', alarm_photo: 'ap' };
+
+  /** All events as rows, newest first (from the cached folder listing). */
+  rows(owner) {
+    const toPath = v => !v ? null : v.startsWith('/') ? owner + v : `${owner}/gd/${v}`;
+    return [...(this.usage?.events || new Map())].map(([id, a]) => ({
+      id, sn: a.sn || '', cam: a.c || '', event: a.e || '', alarm_id: a.a || '', at: a.t, secs: a.s ? +a.s : null, bytes: 0,
+      video: toPath(a.v), photo: toPath(a.p), alarm_photo: toPath(a.ap),
+    })).sort((x, y) => (y.at > x.at) - (y.at < x.at));
+  }
+
+  /** Page of events like the Supabase list: newest first, older than `before`, optionally one camera. */
+  async events(cs, { before = null, limit = 120, sn = null } = {}) {
+    await this.used(!before);
+    const all = this.rows(await cs.owner());
+    const b = before && new Date(before).toISOString();
+    const rows = all.filter(r => (!sn || r.sn === sn) && (!b || r.at < b)).slice(0, limit);
+    return { rows, used: 0, count: all.length, quota: GDRIVE.quota };
+  }
+
+  async putEvent(cs, ev) {
+    const owner = await cs.owner();
+    const val = p => isGdPath(p) ? p.split('/')[2] : p.startsWith(owner + '/') ? p.slice(owner.length) : null;
+    const props = { k: 'ev', sn: String(ev.sn || '').slice(0, 40), a: String(ev.alarm_id || '').slice(0, 80) };
+    if (ev.cam) props.c = String(ev.cam).slice(0, 100);
+    if (ev.event) props.e = String(ev.event).slice(0, 100);
+    if (ev.at) props.t = new Date(ev.at).toISOString();
+    if (ev.secs != null) props.s = String(Math.round(ev.secs * 1000) / 1000);
+    for (const [f, k] of Object.entries(DriveStore.PROPS)) if (ev[f]) props[k] = val(ev[f]);
+    // one marker per sn + alarm id; concurrent puts of one event (photo, then video) wait for each other
+    const key = `${props.sn}|${props.a}`;
+    this.evLock ||= new Map();
+    const run = (this.evLock.get(key) || Promise.resolve()).catch(() => {}).then(() => this.writeEvent(key, props));
+    this.evLock.set(key, run);
+    return run;
+  }
+
+  async writeEvent(key, props) {
+    const { folder } = await this.token();
+    this.evIds ||= new Map();
+    let id = this.evIds.get(key);
+    if (!id) {
+      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false and appProperties has { key='a' and value='${props.a.replace(/'/g, "\\'")}' }`, fields: 'files(id,appProperties)' });
+      const f = (await (await this.api(`https://www.googleapis.com/drive/v3/files?${q}`)).json()).files?.find(x => x.appProperties?.sn === props.sn);
+      id = f?.id;
+    }
+    if (id) {
+      await this.api(`https://www.googleapis.com/drive/v3/files/${id}?fields=id`, { method: 'PATCH', body: JSON.stringify({ appProperties: props }), headers: { 'Content-Type': 'application/json' } });
+    } else {
+      const name = `ev ${props.c || props.sn} ${(props.t || new Date().toISOString()).slice(0, 19)}`;
+      id = await this.upload(name, new Blob(['{}'], { type: 'application/json' }), 'application/json', { appProperties: props });
+    }
+    this.evIds.set(key, id);
+    if (this.usage) this.usage.events.set(id, { ...(this.usage.events.get(id) || {}), ...props });
+    return id;
+  }
+
+  /** Deletes events (marker ids) with their files; returns how many files went. */
+  async removeEvents(cs, ids) {
+    const u = await this.used(), owner = await cs.owner(), sb = [];
+    let n = 0;
+    for (const id of ids) {
+      let a = u.events.get(id);
+      if (!a) a = (await (await this.api(`https://www.googleapis.com/drive/v3/files/${id}?fields=appProperties`)).json()).appProperties || {};
+      const files = [a.v, a.p, a.ap].filter(Boolean);
+      sb.push(...files.filter(v => v.startsWith('/')).map(v => owner + v));
+      await this.remove([...files.filter(v => !v.startsWith('/')), id]);
+      u.events.delete(id);
+      for (const [k, v] of this.evIds || []) if (v === id) this.evIds.delete(k);
+      n += files.length;
+    }
+    if (sb.length) await cs.removePaths(sb);
+    return n;
   }
 
   /** Stores a clip video or photo: room first, then the upload → row path <owner>/gd/<id>. */

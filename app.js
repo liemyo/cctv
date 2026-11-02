@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=10';
-import { installHik } from './hikweb.js?v=10';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=11';
+import { installHik } from './hikweb.js?v=11';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=7';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
@@ -1384,7 +1384,7 @@ async function viewKlip() {
       rows = before ? rows.concat(page.rows) : page.rows;
       if (!before) {
         used = page.used; quota = page.quota;
-        cs.drive.connected().then(on => on && cs.drive.used(true)).then(u => { drive = u || null; if (S.view === 'klip' && u) draw(); }).catch(() => {});
+        cs.drive.connected().then(on => on && cs.drive.used()).then(u => { drive = u || null; if (S.view === 'klip' && u) draw(); }).catch(() => {});
       }
       count = page.count;
       const paths = [...new Set(page.rows.map(thumbKey).filter(Boolean))];
