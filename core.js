@@ -521,8 +521,10 @@ export class CloudStore {
   async getPrefs() { return this.getDoc('web-prefs'); }
   async putPrefs(prefs, opts) { return this.putDoc('web-prefs', prefs, opts); }
 
-  /** Newest JSON file in <owner>/<name>/ (web settings, the Hik-Connect relay address). */
+  /** Web settings / the Hik-Connect relay address: in Google Drive when it is connected, else the newest JSON file in
+   *  <owner>/<name>/ of the Supabase bucket. */
   async getDoc(name) {
+    if (await this.drive.connected()) return this.drive.getDoc(name);
     const dir = `${await this.owner()}/${name}/`;
     const r = await fetch(`${CLOUD.base}/storage/v1/object/list/${CLOUD.bucket}`, {
       method: 'POST', headers: this.headers({ 'Content-Type': 'application/json' }),
@@ -539,6 +541,7 @@ export class CloudStore {
   }
 
   async putDoc(name, doc, { keepalive = false, old = [] } = {}) {
+    if (await this.drive.connected()) return this.drive.putDoc(name, doc, { keepalive });
     const dir = `${await this.owner()}/${name}/`;
     const r = await fetch(`${CLOUD.base}/storage/v1/object/${CLOUD.bucket}/${dir}${doc.t}.jpg`, {
       method: 'POST', keepalive, body: JSON.stringify(doc),
@@ -654,20 +657,21 @@ export class DriveStore {
     return r;
   }
 
-  /** Bytes used by the folder + size of each file (cached 10 min; uploads / deletes keep it current). */
+  /** Bytes used by the folder + size and thumbnail link of each file (cached 10 min; uploads / deletes keep it current).
+   *  Thumbnail links (lh3.googleusercontent.com, valid for hours) open without a token, so they work as <img src>. */
   async used(fresh = false) {
     if (!fresh && this.usage && Date.now() - this.usage.at < 600000) return this.usage;
-    const { folder } = await this.token(), sizes = new Map();
+    const { folder } = await this.token(), sizes = new Map(), thumbs = new Map();
     let page = '';
     do {
-      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false`, fields: 'nextPageToken,files(id,size)', pageSize: '1000', ...(page ? { pageToken: page } : {}) });
+      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false`, fields: 'nextPageToken,files(id,size,thumbnailLink)', pageSize: '1000', ...(page ? { pageToken: page } : {}) });
       const j = await (await this.api(`https://www.googleapis.com/drive/v3/files?${q}`)).json();
-      for (const f of j.files || []) sizes.set(f.id, +f.size || 0);
+      for (const f of j.files || []) { sizes.set(f.id, +f.size || 0); if (f.thumbnailLink) thumbs.set(f.id, f.thumbnailLink); }
       page = j.nextPageToken || '';
     } while (page);
     let bytes = 0;
     for (const v of sizes.values()) bytes += v;
-    return (this.usage = { bytes, sizes, at: Date.now() });
+    return (this.usage = { bytes, sizes, thumbs, at: Date.now() });
   }
 
   /** Uploads one file into the folder → Drive file id. */
@@ -687,6 +691,50 @@ export class DriveStore {
 
   async blob(id) { return (await this.api(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).blob(); }
 
+  /** Object URL of a Drive file, kept for this visit (photos, clips opened again). */
+  async objectURL(id) {
+    this.urls ||= new Map();
+    if (!this.urls.has(id)) this.urls.set(id, this.blob(id).then(b => URL.createObjectURL(b)).catch(e => { this.urls.delete(id); throw e; }));
+    return this.urls.get(id);
+  }
+
+  /** Picture URLs for row paths (<owner>/gd/<id>): Drive's thumbnail (size px), else — for photos, not for videos
+   *  (`videos`) — the file itself (Drive makes thumbnails a little after the upload). */
+  async thumbURLs(paths, { size = 400, videos = new Set() } = {}) {
+    const out = {}, u = await this.used(true);
+    await Promise.all(paths.map(async p => {
+      const id = p.split('/')[2], t = u.thumbs.get(id);
+      out[p] = t ? t.replace(/=s\d+$/, '') + `=s${size}` : videos.has(p) ? null : await this.objectURL(id).catch(() => null);
+    }));
+    return out;
+  }
+
+  // Small JSON documents (web settings, the Hik-Connect relay address) as "pantau-<name>.json" in the folder,
+  // updated in place.
+  async docFile(name) {
+    this.docs ||= new Map();
+    if (this.docs.has(name)) return this.docs.get(name);
+    const { folder } = await this.token();
+    const q = new URLSearchParams({ q: `'${folder}' in parents and name = 'pantau-${name}.json' and trashed = false`, fields: 'files(id)', orderBy: 'modifiedTime desc' });
+    const id = (await (await this.api(`https://www.googleapis.com/drive/v3/files?${q}`)).json()).files?.[0]?.id || null;
+    if (id) this.docs.set(name, id);
+    return id;
+  }
+  async getDoc(name) {
+    const id = await this.docFile(name);
+    if (!id) return null;
+    const r = await this.api(`https://www.googleapis.com/drive/v3/files/${id}?alt=media&t=${Date.now()}`, { cache: 'no-store' });
+    return { ...(await r.json()), old: [] };
+  }
+  async putDoc(name, doc, { keepalive = false } = {}) {
+    const id = await this.docFile(name), body = JSON.stringify(doc);
+    if (id) {
+      await this.api(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, { method: 'PATCH', keepalive, body, headers: { 'Content-Type': 'application/json' } });
+      return;
+    }
+    this.docs.set(name, await this.upload(`pantau-${name}.json`, new Blob([body], { type: 'application/json' }), 'application/json'));
+  }
+
   async remove(ids) {
     for (const id of ids) {
       await this.api(`https://www.googleapis.com/drive/v3/files/${id}`, { method: 'DELETE' });
@@ -694,7 +742,7 @@ export class DriveStore {
     }
   }
 
-  /** Rolling storage: deletes the OLDEST Klip events that have a Drive video until `incoming` more bytes fit in
+  /** Rolling storage: deletes the OLDEST Klip events that have Drive files until `incoming` more bytes fit in
    *  GDRIVE.quota. Returns how many events were removed. */
   async makeRoom(cs, incoming) {
     const u = await this.used();
@@ -712,15 +760,16 @@ export class DriveStore {
     const ids = [];
     for (const r of rows) {
       if (left + incoming <= room) break;
-      if (!isGdPath(r.video)) continue;
+      const files = [r.video, r.photo, r.alarm_photo].filter(isGdPath);
+      if (!files.length) continue;
       ids.push(r.id);
-      left -= u.sizes.get(r.video.split('/')[2]) || 0;
+      for (const p of files) left -= u.sizes.get(p.split('/')[2]) || 0;
     }
     if (ids.length) await cs.remove(ids);
     return ids.length;
   }
 
-  /** Stores a clip video: room first, then the upload → row path <owner>/gd/<id>. */
+  /** Stores a clip video or photo: room first, then the upload → row path <owner>/gd/<id>. */
   async put(cs, name, blob, mime) {
     await this.makeRoom(cs, blob.size);
     return `${await cs.owner()}/gd/${await this.upload(name, blob, mime)}`;

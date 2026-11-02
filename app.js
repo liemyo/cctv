@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=9';
-import { installHik } from './hikweb.js?v=9';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=10';
+import { installHik } from './hikweb.js?v=10';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=7';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
@@ -696,9 +696,9 @@ async function cloudSave(cap, kind, blob, mime, secs) {
   if (!cs) return;
   try {
     const name = `${cap.id}.${kind === 'video' ? 'mp4' : 'jpg'}`;
-    // videos go to Google Drive when it is connected (photos stay in Supabase); a failed Drive upload falls back
+    // photos and videos go to Google Drive when it is connected; a failed Drive upload falls back to Supabase
     let path = null;
-    if (kind === 'video' && await cs.drive.connected()) {
+    if (await cs.drive.connected()) {
       try { path = await cs.drive.put(cs, `${cap.cam || cap.sn} ${fileStamp(cap.at)} ${name}`, blob, mime); }
       catch (e) { console.warn('drive', e); }
     }
@@ -1310,6 +1310,9 @@ async function viewPesan() {
 
 // ---------- motion clips (Supabase, uploaded by the Mac app's recorder) ----------
 
+// Picture for a clip card: the photos, else Drive's own thumbnail of the video.
+const thumbKey = r => r.alarm_photo || r.photo || (isGdPath(r.video) ? r.video : null);
+
 async function viewKlip() {
   const main = $('#main');
   if (!CloudStore.isValidKey(store.get('cloudKey', ''))) {
@@ -1350,7 +1353,7 @@ async function viewKlip() {
     list.forEach((r, k) => {
       const t = new Date(r.at), dl = dayLabel(t);
       if (dl !== lastDay) { html += `${lastDay ? '</div>' : ''}<div class="day">${dl}</div><div class="list">`; lastDay = dl; }
-      const th = thumbs[r.alarm_photo || r.photo];
+      const th = thumbs[thumbKey(r)];
       html += `<button class="ev glass" data-k="${k}"><div class="thumb">${th ? `<img loading="lazy" src="${esc(th)}" alt="">` : ic('film')}
         ${r.video ? `<span class="play">${ic('play')}</span>` : ''}</div>
         <div class="meta"><b>${esc(eventLabel(r.event))}</b><span>${esc(r.cam || devBySn(r.sn)?.name || r.sn)} · ${timeLabel(t)}${r.secs ? ` · ${Math.round(r.secs)} dtk` : ''}</span></div></button>`;
@@ -1358,16 +1361,16 @@ async function viewKlip() {
     if (lastDay) html += '</div>';
     $('#out').innerHTML = list.length ? html + (rows.length < count ? '<div class="row" style="justify-content:center;margin-top:16px"><button class="btn" id="more">Muat lagi</button></div>' : '')
       : '<div class="empty glass">Belum ada klip.</div>';
-    $('#usage').textContent = `${count} kejadian · ${drive ? `Drive ${fmtBytes(drive.bytes)} dari ${fmtBytes(GDRIVE.quota)} · foto ` : ''}${fmtBytes(used)} dari ${fmtBytes(quota)}`;
+    $('#usage').textContent = `${count} kejadian · ${drive ? `Drive ${fmtBytes(drive.bytes)} dari ${fmtBytes(GDRIVE.quota)}${used ? ` · Supabase ${fmtBytes(used)}` : ''}` : `${fmtBytes(used)} dari ${fmtBytes(quota)}`}`;
     main.querySelectorAll('.ev').forEach(b => b.onclick = () => {
       const items = list.map(r => ({
-        video: !!r.video, poster: thumbs[r.alarm_photo || r.photo],
+        video: !!r.video, poster: thumbs[thumbKey(r)],
         caption: `${eventLabel(r.event)} · ${r.cam || ''} · ${dayLabel(new Date(r.at))} ${timeLabel(new Date(r.at))}`,
         file: (r.video || r.photo || r.alarm_photo || 'klip').split('/').pop(),
         resolve: async () => {
           const p = r.video || r.photo || r.alarm_photo;
           if (!p) return null;
-          if (isGdPath(p)) return thumbs[p] ||= URL.createObjectURL(await cs.drive.blob(p.split('/')[2]));
+          if (isGdPath(p)) return cs.drive.objectURL(p.split('/')[2]);
           return thumbs[p] || (await cs.signedURLs([p]))[p] || null;
         },
       }));
@@ -1384,9 +1387,11 @@ async function viewKlip() {
         cs.drive.connected().then(on => on && cs.drive.used(true)).then(u => { drive = u || null; if (S.view === 'klip' && u) draw(); }).catch(() => {});
       }
       count = page.count;
-      const paths = [...new Set(page.rows.map(r => r.alarm_photo || r.photo).filter(Boolean))];
+      const paths = [...new Set(page.rows.map(thumbKey).filter(Boolean))];
       draw();
-      for (let i = 0; i < paths.length; i += 100) Object.assign(thumbs, await cs.signedURLs(paths.slice(i, i + 100)));
+      const gd = paths.filter(isGdPath), sb = paths.filter(p => !isGdPath(p));
+      if (gd.length) Object.assign(thumbs, await cs.drive.thumbURLs(gd, { videos: new Set(page.rows.map(r => r.video)) }).catch(() => ({})));
+      for (let i = 0; i < sb.length; i += 100) Object.assign(thumbs, await cs.signedURLs(sb.slice(i, i + 100)));
       if (S.view === 'klip') draw();
     } catch (e) { $('#out').innerHTML = `<div class="empty glass">${esc(e.message)}</div>`; }
   };
@@ -1473,9 +1478,9 @@ async function driveCard(box) {
   if (!box.isConnected) return;
   box.outerHTML = `<div id="gd" style="display:grid;gap:8px">
     <div class="row"><div><b>Google Drive</b><div class="muted small">${st.connected
-      ? `Tersambung · ${esc(st.email || 'akun Google')} — video klip baru disimpan di folder <b>Pantau Klip</b>, maks ${fmtBytes(GDRIVE.quota)} (yang terlama dihapus otomatis). Foto tetap di cloud Pantau.`
+      ? `Tersambung · ${esc(st.email || 'akun Google')} — foto, video klip & setelan situs disimpan di folder <b>Pantau Klip</b>, maks ${fmtBytes(GDRIVE.quota)} (yang terlama dihapus otomatis).`
       : st.error ? 'Tidak bisa memeriksa sambungan Google Drive (internet?).'
-      : `Belum tersambung — video klip disimpan di cloud Pantau (900 MB). Sambungkan untuk menyimpan video di Google Drive (maks ${fmtBytes(GDRIVE.quota)}).`}</div></div>
+      : `Belum tersambung — klip disimpan di cloud Pantau (900 MB). Sambungkan untuk menyimpan klip & setelan di Google Drive (maks ${fmtBytes(GDRIVE.quota)}).`}</div></div>
       <span class="spacer"></span>${st.connected ? '<button class="btn danger" id="gdoff">Putuskan</button>' : st.error ? '' : '<button class="btn primary" id="gdon">Sambungkan</button>'}</div>
     ${st.connected ? '<div class="muted small" id="gdu"></div>' : ''}</div>`;
   $('#gdon') && ($('#gdon').onclick = async e => {
