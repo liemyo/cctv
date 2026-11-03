@@ -1,6 +1,7 @@
-// Hik-Connect part of the site (own menu, separate from iCSee). Hik-Connect's cloud has no browser API,
-// so everything goes through the small relay on the Mac (hik-relay/), reached over a Cloudflare quick tunnel.
-// The relay's address sits in the CCTV cloud folder; the access key is derived from the Klip Gerak key.
+// Hik-Connect part of the site (own menu, separate from iCSee). Hik-Connect's cloud has no browser API (its
+// video servers only speak raw TCP), so everything goes through the relay (hik-relay/). First choice is the
+// always-on relay server (HIK_SERVERS, no Mac needed); the Mac relay behind a Cloudflare quick tunnel, whose
+// address sits in the CCTV cloud folder, is the fallback. The access key is derived from the Klip Gerak key.
 import { sha256Hex } from './core.js?v=11';
 
 export function installHik(x) {
@@ -9,6 +10,7 @@ export function installHik(x) {
   // ---------- relay connection ----------
 
   store.raw('hikSlow', null);
+  const HIK_SERVERS = ['https://amatu-hik-relay.onrender.com'];
   const R = { base: null, key: null, hello: null, err: null, devices: store.get('hikDevices', []), t: 0 };
   let finding = null;
 
@@ -23,24 +25,29 @@ export function installHik(x) {
     if (R.base && !force) return R.base;
     finding ||= (async () => {
       const key = await relayKey();
+      const hello = async (u, ms) => {
+        const r = await fetch(`${u}/api/hello`, { headers: { 'x-hik-key': key }, signal: AbortSignal.timeout(ms) });
+        if (r.status === 401) throw new Error('kunci');
+        const j = await r.json();
+        if (!j.ok) throw new Error('relay');
+        R.base = u; R.hello = j; R.err = null; return u;
+      };
+      // the server first, straight away (no cloud-folder lookup); all at once so one slow address costs nothing
       const over = new URLSearchParams(location.search).get('relay') || store.get('hikRelayOver', null);
+      const first = [...new Set([...(over ? [over.replace(/\/$/, '')] : []), ...HIK_SERVERS])];
+      try { return await Promise.any(first.map(u => hello(u, 8000))); } catch {}
+      // fallback: the Mac relay (its quick-tunnel address changes, so it is looked up in the cloud folder)
       const cand = [];
-      if (over) cand.push(over.replace(/\/$/, ''));
       const cached = store.get('hikRelay', null);
       if (cached?.url && !force) cand.push(cached.url);
       const cs = cloud();
       let doc = null;
       if (cs) { doc = await cs.getDoc('hik-relay').catch(() => null); if (doc?.url) { cand.push(doc.url); store.raw('hikRelay', { url: doc.url, t: doc.t }); } }
-      for (const u of [...new Set(cand)]) {
-        try {
-          const r = await fetch(`${u}/api/hello`, { headers: { 'x-hik-key': key }, signal: AbortSignal.timeout(9000) });
-          if (r.status === 401) throw new Error('kunci');
-          const j = await r.json();
-          if (j.ok) { R.base = u; R.hello = j; R.err = null; return u; }
-        } catch {}
-      }
+      for (const u of [...new Set(cand)]) { try { return await hello(u, 9000); } catch {} }
+      // a sleeping server (free plan) can take ~1 min to wake: one long last try
+      try { return await Promise.any(HIK_SERVERS.map(u => hello(u, 60000))); } catch {}
       R.base = null;
-      R.err = !doc ? 'Relay Hik-Connect belum pernah aktif di Mac.' : `Relay di Mac tidak bisa dihubungi (Mac mati, tidur, atau tanpa internet). Terakhir aktif ${new Date(doc.t).toLocaleString('id-ID')}.`;
+      R.err = 'Server relay Hik-Connect tidak bisa dihubungi' + (doc ? `, relay cadangan di Mac juga tidak (terakhir aktif ${new Date(doc.t).toLocaleString('id-ID')}).` : '.');
       throw new Error(R.err);
     })().finally(() => { finding = null; });
     return finding;
@@ -94,7 +101,7 @@ export function installHik(x) {
   class HikPlayer extends LivePlayer {
     constructor(video, sn, ch, opts = {}) {
       super(video, { sn: `${sn}.${ch}`, name: chName(dev(sn), ch) }, opts);
-      Object.assign(this, { opts, hsn: sn, hch: ch, mode: 'flv', flvOnly: true, edgeMax: 6, edgeKeep: 1.2, stillMax: 9 });
+      Object.assign(this, { opts, hsn: sn, hch: ch, mode: 'flv', flvOnly: true, edgeMax: 5, edgeKeep: 1.0, stillMax: 9 });
     }
     async start() {
       this.teardown();
@@ -121,7 +128,10 @@ export function installHik(x) {
     }
     playFLV(url) {
       const p = this.mp = mpegts.createPlayer({ type: 'flv', isLive: true, url, hasAudio: false, hasVideo: true }, {
-        enableWorker: false, enableStashBuffer: false, lazyLoad: false, liveBufferLatencyChasing: false, liveSync: false,
+        // stay close to live by playing a little faster (smooth) instead of jumping (a visible skip); only a
+        // big backlog (tab in background, long stall) still jumps, in toEdge (edgeMax)
+        enableWorker: false, enableStashBuffer: false, lazyLoad: false, liveBufferLatencyChasing: false,
+        liveSync: true, liveSyncMaxLatency: 2.2, liveSyncTargetLatency: 1.0, liveSyncPlaybackRate: 1.08,
         autoCleanupSourceBuffer: true, autoCleanupMaxBackwardDuration: 30, autoCleanupMinBackwardDuration: 15,
       });
       p.on(mpegts.Events.ERROR, (type, detail) => {
@@ -158,7 +168,7 @@ export function installHik(x) {
 
   const relayBox = (msg) => `<div class="empty glass hrelay">${ic('cam')}<div><b>Hik-Connect belum tersambung</b>
     <div class="muted small">${esc(msg || R.err || 'Mencari relay…')}</div>
-    <div class="muted small">Relay berjalan otomatis di MacBook (hik-relay). Pastikan MacBook menyala & online.</div>
+    <div class="muted small">Video Hik-Connect lewat server relay (selalu menyala). Coba lagi sebentar lagi.</div>
     <button class="btn" id="hretry">${ic('refresh')}<span>Coba lagi</span></button></div></div>`;
   const bindRetry = () => { const b = $('#hretry'); if (b) b.onclick = () => { R.base = null; route(); }; };
 
@@ -579,8 +589,9 @@ export function installHik(x) {
       await find(true);
       if (!$('#hst')) return;
       const st = await api.status().catch(() => ({}));
-      $('#hst').innerHTML = `Terhubung · akun <b>${esc(R.hello.account || '')}</b> · relay ${esc(R.hello.version)} di MacBook
-        ${st.channels?.length ? ` · ${st.channels.length} siaran aktif` : ''}<br>Video Hik-Connect lewat relay di MacBook (tidak ada server lain); MacBook harus menyala & online.`;
+      const onServer = HIK_SERVERS.includes(R.base);
+      $('#hst').innerHTML = `Terhubung · akun <b>${esc(R.hello.account || '')}</b> · relay ${esc(R.hello.version)} ${onServer ? 'di server' : 'di MacBook (cadangan)'}
+        ${st.channels?.length ? ` · ${st.channels.length} siaran aktif` : ''}<br>${onServer ? 'Video Hik-Connect langsung lewat server relay — tidak perlu MacBook.' : 'Server relay tidak terjangkau, sementara lewat relay di MacBook.'}`;
       const devs = R.devices.length ? R.devices : await api.devices().catch(() => []);
       $('#hkeys').innerHTML = `<details><summary>Kode verifikasi perangkat (untuk video terenkripsi)</summary><div style="display:grid;gap:8px;margin-top:8px">
         ${devs.map(d => `<div class="row"><span>${esc(d.name)}${d.hasKey ? ' · <b>tersimpan</b>' : ''}</span><span class="spacer"></span>
