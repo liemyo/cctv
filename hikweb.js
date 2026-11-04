@@ -10,9 +10,15 @@ export function installHik(x) {
   // ---------- relay connection ----------
 
   store.raw('hikSlow', null);
-  const HIK_SERVERS = ['https://amatu-hik-relay.onrender.com'];
+  const HIK_SERVERS = ['https://hik-relay.liemyo.workers.dev'];
   const R = { base: null, key: null, hello: null, err: null, devices: store.get('hikDevices', []), t: 0 };
   let finding = null;
+
+  // Cloudflare tops up the relay's CPU budget on every incoming request, so a long stream needs a regular knock.
+  const playing = new Set();
+  setInterval(() => {
+    if (playing.size && HIK_SERVERS.includes(R.base)) fetch(`${R.base}/api/hello`, { headers: { 'x-hik-key': R.key } }).catch(() => {});
+  }, 10000);
 
   async function relayKey() {
     await ensureCloudKey().catch(() => false);
@@ -44,8 +50,8 @@ export function installHik(x) {
       let doc = null;
       if (cs) { doc = await cs.getDoc('hik-relay').catch(() => null); if (doc?.url) { cand.push(doc.url); store.raw('hikRelay', { url: doc.url, t: doc.t }); } }
       for (const u of [...new Set(cand)]) { try { return await hello(u, 9000); } catch {} }
-      // a sleeping server (free plan) can take ~1 min to wake: one long last try
-      try { return await Promise.any(HIK_SERVERS.map(u => hello(u, 60000))); } catch {}
+      // one long last try on a slow connection
+      try { return await Promise.any(HIK_SERVERS.map(u => hello(u, 30000))); } catch {}
       R.base = null;
       R.err = 'Server relay Hik-Connect tidak bisa dihubungi' + (doc ? `, relay cadangan di Mac juga tidak (terakhir aktif ${new Date(doc.t).toLocaleString('id-ID')}).` : '.');
       throw new Error(R.err);
@@ -146,6 +152,7 @@ export function installHik(x) {
      *  RTP packet loss and reports slow in /api/health → opts.onSlow (→ SD). Channels without SD never switch. */
     watch(gen) {
       super.watch(gen);
+      playing.add(this);
       clearInterval(this.speedT);
       if (this.stream !== '0' || !this.opts.onSlow || this.noSub) return;
       this.speedT = setInterval(async () => {
@@ -161,7 +168,7 @@ export function installHik(x) {
       this.opts.onSlow(why);
       return true;
     }
-    teardown() { clearInterval(this.speedT); super.teardown(); }
+    teardown() { playing.delete(this); clearInterval(this.speedT); super.teardown(); }
   }
 
   // ---------- pages ----------
