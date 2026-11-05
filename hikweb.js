@@ -174,6 +174,8 @@ export function installHik(x) {
       this.opts.onSlow(why);
       return true;
     }
+    // the relay keeps the camera's stream open, so the first retry costs almost nothing (a decode error on one bad GOP, a dropped socket)
+    retryDelay() { return Math.min(300 + Math.max(0, this.fails - 1) * 1500, 8000); }
     teardown() { playing.delete(this); clearInterval(this.speedT); super.teardown(); }
     /** Back on the tab. Still connected: straight to the newest frame, no reconnect. Released: reconnect (last picture stays). */
     onVisible() {
