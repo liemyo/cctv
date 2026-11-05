@@ -83,21 +83,29 @@ export function installHik(x) {
     records: (sn, ch, start, stop) => req(`/api/records?${qs({ sn, ch, start, stop })}`),
     status: () => req('/api/status'),
     health: (sn, ch, q) => req(`/api/health?${qs({ sn, ch, q })}`, { timeout: 10000, retry: false }),
+    setSlow: (sn, on) => req('/api/slow', { method: 'POST', body: { sn, on } }),
   };
 
   const dev = sn => R.devices.find(d => d.sn === sn);
   const parseId = id => { const [sn, ch] = String(id || '').split('.'); return { sn, ch: Number(ch) || 1 }; };
   const chName = (d, ch) => d?.channels.find(c => c.ch === ch)?.name || `Kamera ${ch}`;
   const allCams = () => R.devices.flatMap(d => d.channels.map(c => ({ d, c })));
+  // the relay remembers NVRs whose upload is too small (for every device); this browser's own mark is a backup
+  const isSlowNvr = sn => !!dev(sn)?.slow || Date.now() - (store.get('hikSlow2', {})[sn] || 0) < 12 * 3600e3;
 
   // ---------- player (relay FLV; never falls back to the iCSee HLS relay) ----------
 
   class HikPlayer extends LivePlayer {
     constructor(video, sn, ch, opts = {}) {
       super(video, { sn: `${sn}.${ch}`, name: chName(dev(sn), ch) }, opts);
-      Object.assign(this, { opts, hsn: sn, hch: ch, mode: 'flv', flvOnly: true, edgeMax: 5, edgeKeep: 1.0, stillMax: 9 });
+      // a slow NVR's video arrives in bursts with pauses of 1–3 s: a bigger cushion plays it smoothly
+      const slow = this.bursty = isSlowNvr(sn);
+      Object.assign(this, { opts, hsn: sn, hch: ch, mode: 'flv', flvOnly: true, edgeMax: slow ? 6 : 3, edgeKeep: slow ? 1.6 : 0.5, stillMax: 9 });
     }
     async start() {
+      this.keepFrame(); // the last picture stays (dimmed) while reconnecting instead of a black screen
+      this.released = false;
+      clearTimeout(this.hideT);
       this.teardown();
       this.stopped = false; this.alive = Date.now();
       const gen = this.gen = (this.gen || 0) + 1;
@@ -125,9 +133,19 @@ export function installHik(x) {
         // stay close to live by playing a little faster (smooth) instead of jumping (a visible skip); only a
         // big backlog (tab in background, long stall) still jumps, in toEdge (edgeMax)
         enableWorker: false, enableStashBuffer: false, lazyLoad: false, liveBufferLatencyChasing: false,
-        liveSync: true, liveSyncMaxLatency: 2.2, liveSyncTargetLatency: 1.0, liveSyncPlaybackRate: 1.08,
+        liveSync: true, liveSyncMaxLatency: this.bursty ? 3.2 : 1.4, liveSyncTargetLatency: this.bursty ? 1.8 : 0.6, liveSyncPlaybackRate: 1.1,
         autoCleanupSourceBuffer: true, autoCleanupMaxBackwardDuration: 30, autoCleanupMinBackwardDuration: 15,
       });
+      // The relay opens with the current GOP (up to ~2 s old) so the picture appears at once: skip to the newest frame.
+      const v = this.video, hop = () => {
+        v.removeEventListener('canplay', hop);
+        if (this.mp !== p || !v.buffered.length) return;
+        const end = v.buffered.end(v.buffered.length - 1), keep = this.edgeKeep;
+        if (end - v.currentTime > keep + 0.3) v.currentTime = end - keep;
+      };
+      v.addEventListener('canplay', hop);
+      // the relay closed the socket (restarted, video server gone): mpegts reports that as a normal end, not an error
+      p.on(mpegts.Events.LOADING_COMPLETE, () => { if (this.mp === p && !this.stopped) { this.fails++; this.retry('Siaran terputus — menyambung ulang…'); } });
       p.on(mpegts.Events.ERROR, (type, detail) => {
         if (this.stream === '0' && (this.mseErr = (this.mseErr || []).filter(t => Date.now() - t < 90e3).concat(Date.now())).length >= 2 && this.slow('decode')) return;
         this.fails++; this.retry(`Siaran terputus (${detail || type})`);
@@ -157,6 +175,28 @@ export function installHik(x) {
       return true;
     }
     teardown() { playing.delete(this); clearInterval(this.speedT); super.teardown(); }
+    /** Back on the tab. Still connected: straight to the newest frame, no reconnect. Released: reconnect (last picture stays). */
+    onVisible() {
+      clearTimeout(this.hideT);
+      if (this.stopped) return;
+      if (this.released || !this.mp) return this.start();
+      const v = this.video;
+      if (v.buffered.length) { const end = v.buffered.end(v.buffered.length - 1); if (end - v.currentTime > this.edgeKeep + 0.5) v.currentTime = end - this.edgeKeep; }
+      this.kick();
+    }
+    /** A tab out of sight doesn't decode anyway, but its stream keeps using the NVR's upload (and on a slow NVR starves
+     *  every other viewer). Let go after a moment, unless it is being recorded or floats in picture-in-picture. */
+    onHidden() {
+      clearTimeout(this.hideT);
+      this.hideT = setTimeout(() => {
+        if (!document.hidden || this.stopped || this.opts.busy?.() || document.pictureInPictureElement === this.video) return;
+        this.keepFrame();
+        this.gen++; clearTimeout(this.rt);
+        this.teardown();
+        this.released = true;
+      }, 20000);
+    }
+    stop() { clearTimeout(this.hideT); super.stop(); }
   }
 
   // ---------- pages ----------
@@ -252,8 +292,8 @@ export function installHik(x) {
     const d = dev(sn);
     if (!d) return go('hik');
     const cams = d.channels, idx = cams.findIndex(c => c.ch === ch);
-    // NVRs whose upload was too slow for HD start in SD for 12 h (store hikSlow2: sn → time; old hikSlow held wrong marks), unless HD is picked by hand
-    const slowMap = store.get('hikSlow2', {}), slowNvr = Date.now() - (slowMap[sn] || 0) < 12 * 3600e3;
+    // NVRs whose upload is too slow for HD start in SD (marked by the relay and in store hikSlow2: sn → time), unless HD is picked by hand
+    const slowNvr = isSlowNvr(sn);
     let q0 = store.get('hikQuality', 'sub'), autoSD = false;
     if (q0 === 'main' && slowNvr) { q0 = 'sub'; autoSD = true; }
     const pad = `<div class="pad">
@@ -328,6 +368,7 @@ export function installHik(x) {
       player?.stop();
       player = new HikPlayer(video, sn, ch, {
         stream,
+        busy: () => !!rec,
         onSlow: manualHD ? null : () => {
           const m = store.get('hikSlow2', {}); m[sn] = Date.now(); store.set('hikSlow2', m);
           toast('Internet di lokasi NVR terlalu lambat untuk HD — beralih ke SD agar lancar');
@@ -340,6 +381,7 @@ export function installHik(x) {
           if (s === 'retry') { setMsg(v); $('#lb').innerHTML = '<i class="dot offline"></i><span>Terputus</span>'; }
           if (s === 'play') { setMsg(null); label(); }
           if (s === 'tick') label();
+          if (s === 'stall') $('#lb').innerHTML = '<i class="dot sleeping"></i><span>Menunggu data dari NVR…</span>';
           if (s === 'blocked') setMsg('Ketuk layar untuk memutar', false);
           if (s === 'key') { keyForm(v); $('#lb').innerHTML = '<i class="dot offline"></i><span>Terkunci</span>'; }
           if (s === 'off') { setMsg(v); $('#lb').innerHTML = '<i class="dot offline"></i><span>Offline</span>'; }
@@ -347,14 +389,18 @@ export function installHik(x) {
       });
       player.start();
     };
-    let manualHD = false;
+    let manualHD = false, rec;
     $('#q').value = q0;
     start(q0 === 'main' ? '0' : '1');
     $('#q').onchange = e => {
       const hd = e.target.value === 'main';
       store.set('hikQuality', e.target.value); $('#autosd').hidden = true;
       // HD picked by hand on a slow NVR: respect it for this view (no auto switch), forget the slow mark
-      if (hd && (autoSD || slowNvr || store.get('hikSlow2', {})[sn])) { manualHD = true; const m = store.get('hikSlow2', {}); delete m[sn]; store.set('hikSlow2', m); }
+      if (hd && (autoSD || slowNvr || isSlowNvr(sn))) {
+        manualHD = true;
+        const m = store.get('hikSlow2', {}); delete m[sn]; store.set('hikSlow2', m);
+        if (d.slow) { d.slow = false; api.setSlow(sn, false).catch(() => {}); }
+      }
       start(hd ? '0' : '1');
     };
     $('#fill').onclick = () => { stage.classList.toggle('fill'); $('#fill').classList.toggle('on'); };
@@ -376,7 +422,6 @@ export function installHik(x) {
         try { saveBlob(await (await fetch(api.snapURL(sn, ch, 1))).blob(), name); toast('Foto dari cloud disimpan'); } catch (e) { toast(e.message); }
       }
     };
-    let rec;
     $('#rec').onclick = () => {
       if (rec) { rec.stop(); return; }
       const stream = video.captureStream?.() || video.mozCaptureStream?.();
@@ -412,6 +457,10 @@ export function installHik(x) {
     let page = Math.min(store.get('hikMultiPage', 0), pages - 1);
     const cams = list.slice(page * per, page * per + per);
     const cols = n === 1 ? 1 : Math.min(n, Math.ceil(Math.sqrt(cams.length))), rows = Math.ceil(cams.length / cols) || 1;
+    // A slow NVR carries one stream, and several at once all stop (Klontong measured: 1 runs, the others ~1 frame/s).
+    // So one tile of it plays video and the rest show a fresh cloud photo in turn; tapping a tile opens it live.
+    const liveOf = new Set(), photoOf = cam => { const k = cam.d.sn; if (!isSlowNvr(k) || cam.c.locked) return false; if (liveOf.has(k)) return true; liveOf.add(k); return false; };
+    const tiles = cams.map(cam => ({ ...cam, photo: photoOf(cam) })), photos = tiles.filter(t => t.photo);
     $('#main').innerHTML = `
       ${topbar('Multi Layar · Hik', `
         <div class="scroller">${[['all', 'Semua'], ...R.devices.map(d => [d.sn, d.name])].map(([k, v]) => `<button class="chip ${only === k ? 'on' : ''}" data-ms="${esc(k)}">${esc(v)}</button>`).join('')}</div>
@@ -419,9 +468,10 @@ export function installHik(x) {
         <button class="btn icon ${cover ? 'on' : ''}" id="mc" title="Isi penuh (potong tepi)">${ic('full')}</button>
         <div class="seg">${[1, 2, 3, 4].map(k => `<button data-n="${k}" class="${k === n ? 'on' : ''}">${k === 1 ? '1' : `${k}×${k}`}</button>`).join('')}</div>`)}
       ${!R.base && !R.devices.length ? relayBox() : ''}
-      <div class="multi ${cover ? 'cover' : ''}" style="--mcols:repeat(${cols},minmax(0,1fr));--mrows:repeat(${rows},minmax(0,1fr));--pcols:repeat(${n === 1 ? 1 : 2},minmax(0,1fr))">${cams.map(({ d, c }) => `
-        <div class="tile" data-hid="${esc(d.sn)}.${c.ch}"><video playsinline muted autoplay></video>
-          <span class="badge"><i class="dot"></i>${esc(c.name)}</span></div>`).join('')}</div>
+      ${photos.length ? `<div class="muted small mhint">Internet di lokasi ${esc([...new Set(photos.map(t => t.d.name))].join(', '))} hanya cukup untuk 1 video: kamera lainnya tampil sebagai foto yang diperbarui bergantian. Ketuk kamera untuk video langsung.</div>` : ''}
+      <div class="multi ${cover ? 'cover' : ''}" style="--mcols:repeat(${cols},minmax(0,1fr));--mrows:repeat(${rows},minmax(0,1fr));--pcols:repeat(${n === 1 ? 1 : 2},minmax(0,1fr))">${tiles.map(({ d, c, photo }) => `
+        <div class="tile" data-hid="${esc(d.sn)}.${c.ch}" ${photo ? 'data-photo="1"' : ''}>${photo ? '<img class="tsnap" alt="">' : '<video playsinline muted autoplay></video>'}
+          <span class="badge"><i class="dot"></i>${esc(c.name)}${photo ? ' · foto' : ''}</span></div>`).join('')}</div>
       <button class="btn icon mexit" title="Tutup">${ic('x')}</button>`;
     bindRetry();
     document.querySelectorAll('.seg [data-n]').forEach(b => b.onclick = () => { store.set('hikMultiN', +b.dataset.n); store.set('hikMultiPage', 0); route(); });
@@ -433,8 +483,9 @@ export function installHik(x) {
     document.querySelectorAll('.tile').forEach(t => {
       const { sn, ch } = parseId(t.dataset.hid), dot = t.querySelector('.dot');
       t.onclick = () => go('hiklive', t.dataset.hid);
+      if (t.dataset.photo) return;
       const p = new HikPlayer(t.querySelector('video'), sn, ch, {
-        stream: n === 1 && !(Date.now() - (store.get('hikSlow2', {})[sn] || 0) < 12 * 3600e3) ? '0' : '1',
+        stream: n === 1 && !isSlowNvr(sn) ? '0' : '1',
         onSlow: () => { const m = store.get('hikSlow2', {}); m[sn] = Date.now(); store.set('hikSlow2', m); p.stream = '1'; p.start(); },
         onState: (s, v) => {
           if (s === 'off' || s === 'key') t.insertAdjacentHTML('beforeend', `<div class="tlock">${ic(s === 'key' ? 'lock' : 'cam')}<span>${esc(s === 'key' ? `Terkunci · isi kode ${dev(sn)?.name || ''} di Saya` : v)}</span></div>`);
@@ -443,8 +494,38 @@ export function installHik(x) {
         },
       });
       p.start();
-      t.onclick = () => go('hiklive', t.dataset.hid);
     });
+    // photos of the slow NVRs' other cameras, one request at a time so the NVR isn't asked for more than it can send
+    const shots = [...document.querySelectorAll('.tile[data-photo]')];
+    if (shots.length) {
+      let i = 0, gone = false;
+      x.onLeave = () => { gone = true; };
+      const next = async () => {
+        if (gone) return;
+        await find().catch(() => {});
+        const t = shots[i++ % shots.length], img = t.querySelector('img'), { sn, ch } = parseId(t.dataset.hid), dot = t.querySelector('.dot');
+        if (!document.hidden && t.isConnected) {
+          t.classList.toggle('wait', !img.getAttribute('src'));
+          try {
+            const r = await fetch(api.snapURL(sn, ch, 3), { signal: AbortSignal.timeout(20000) });
+            if (r.ok) {
+              const url = URL.createObjectURL(await r.blob());
+              if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+              img.src = url; dot.className = 'dot online';
+            } else dot.className = 'dot offline';
+          } catch { dot.className = 'dot offline'; }
+          t.classList.remove('wait');
+        }
+        if (!gone) setTimeout(next, 4000);
+      };
+      next();
+    }
+    // an NVR can turn out to be slow (or stop being so) while this page is open: lay the tiles out again
+    const slowSig = () => R.devices.filter(d => d.slow).map(d => d.sn).join();
+    let sig = slowSig();
+    const recheck = () => { if (document.hidden) return; api.devices().then(() => { if (S.view === 'hikmulti' && slowSig() !== sig) { sig = slowSig(); route(); } }).catch(() => {}); };
+    recheck();
+    S.tick = setInterval(recheck, 30000);
   }
 
   // playback from the NVR's disk

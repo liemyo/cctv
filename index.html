@@ -298,6 +298,9 @@ body[data-app="hik"] { --accent: #e0313a; --accent-ink: #fff; }
 .thumb > img:not([src]) { display: none; }
 .badge.lock { left: auto; right: 8px; background: rgba(224,49,58,.8); }
 .tile .tlock { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 8px; padding: 16px; text-align: center; font-size: 13px; color: var(--muted); }
+.tile img.tsnap { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+.multi.cover .tile img.tsnap { object-fit: cover; }
+.mhint { padding: 0 2px 8px; }
 .tile .tlock .i { width: 26px; height: 26px; color: #e0313a; }
 .chip.hc { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 .hrelay { display: flex; gap: 14px; align-items: flex-start; text-align: left; max-width: 620px; margin-top: 12px; }
@@ -462,6 +465,6 @@ body[data-view="multi"]::before, body[data-view="multi"]::after { animation-play
 </head>
 <body>
 <div id="root"></div>
-<script type="module" src="app.js?v=37"></script>
+<script type="module" src="app.js?v=38"></script>
 </body>
 </html>

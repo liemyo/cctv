@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
 import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=11';
-import { installHik } from './hikweb.js?v=16';
+import { installHik } from './hikweb.js?v=17';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=7';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
@@ -662,9 +662,9 @@ document.addEventListener('pointerdown', () => players.forEach(p => p.blocked &&
 // Phones suspend the page (and drop the stream) in the background: after a longer absence reconnect instead of resuming a dead stream.
 let hiddenAt = 0;
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { hiddenAt = Date.now(); return; }
+  if (document.hidden) { hiddenAt = Date.now(); players.forEach(p => p.onHidden?.()); return; }
   const away = hiddenAt && Date.now() - hiddenAt > 8000;
-  players.forEach(p => { p.alive = Date.now(); if (away) p.start(); else { p.toEdge(); p.kick(); } });
+  players.forEach(p => { p.alive = Date.now(); if (p.onVisible) p.onVisible(away); else if (away) p.start(); else { p.toEdge(); p.kick(); } });
 });
 // Supervisor above every player's own watchdog: whatever got stuck (a hung request, a timer that never
 // fired, a stream that neither plays nor errors), 25 s on screen without a moving picture → start over.
