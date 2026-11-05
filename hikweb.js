@@ -481,10 +481,9 @@ export function installHik(x) {
     $('#np') && ($('#np').onclick = () => { store.set('hikMultiPage', (page + 1) % pages); route(); });
     $('#mc').onclick = () => { const on = !$('.multi').classList.contains('cover'); $('.multi').classList.toggle('cover', on); $('#mc').classList.toggle('on', on); store.set('multiCover', on); };
     $('.mexit').onclick = () => go('hik');
-    document.querySelectorAll('.tile').forEach(t => {
+    const shots = [...document.querySelectorAll('.tile[data-photo]')];
+    const startVideo = t => {
       const { sn, ch } = parseId(t.dataset.hid), dot = t.querySelector('.dot');
-      t.onclick = () => go('hiklive', t.dataset.hid);
-      if (t.dataset.photo) return;
       const p = new HikPlayer(t.querySelector('video'), sn, ch, {
         stream: n === 1 && !isSlowNvr(sn) ? '0' : '1',
         onSlow: () => { const m = store.get('hikSlow2', {}); m[sn] = Date.now(); store.set('hikSlow2', m); p.stream = '1'; p.start(); },
@@ -492,34 +491,54 @@ export function installHik(x) {
           if (s === 'off' || s === 'key') t.insertAdjacentHTML('beforeend', `<div class="tlock">${ic(s === 'key' ? 'lock' : 'cam')}<span>${esc(s === 'key' ? `Terkunci · isi kode ${dev(sn)?.name || ''} di Saya` : v)}</span></div>`);
           dot.className = 'dot ' + (s === 'play' || s === 'tick' ? 'online' : s === 'retry' || s === 'key' || s === 'off' ? 'offline' : 'sleeping');
           t.classList.toggle('wait', s === 'connect' || s === 'retry');
+          if (s === 'off') promote(sn); // an offline camera takes nothing from the NVR: its video slot goes to the next one
         },
       });
       p.start();
+    };
+    const promote = sn => {
+      const i = shots.findIndex(t => parseId(t.dataset.hid).sn === sn);
+      if (i < 0) return;
+      const [t] = shots.splice(i, 1), img = t.querySelector('img');
+      if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+      img.outerHTML = '<video playsinline muted autoplay></video>';
+      delete t.dataset.photo;
+      const b = t.querySelector('.badge'); b.lastChild.textContent = b.lastChild.textContent.replace(' · foto', '');
+      startVideo(t);
+    };
+    document.querySelectorAll('.tile').forEach(t => {
+      t.onclick = () => go('hiklive', t.dataset.hid);
+      if (!t.dataset.photo) startVideo(t);
     });
-    // photos of the slow NVRs' other cameras, one request at a time so the NVR isn't asked for more than it can send
-    const shots = [...document.querySelectorAll('.tile[data-photo]')];
+    // Photos of the slow NVRs' other cameras: two requests at a time so the NVR isn't asked for more than it can send.
+    // A camera that doesn't answer (offline: ~30 s) must not hold up the others, so it sits out a while.
     if (shots.length) {
       let i = 0, gone = false;
       x.onLeave = () => { gone = true; };
-      const next = async () => {
-        if (gone) return;
-        await find().catch(() => {});
-        const t = shots[i++ % shots.length], img = t.querySelector('img'), { sn, ch } = parseId(t.dataset.hid), dot = t.querySelector('.dot');
-        if (!document.hidden && t.isConnected) {
-          t.classList.toggle('wait', !img.getAttribute('src'));
-          try {
-            const r = await fetch(api.snapURL(sn, ch, 3), { signal: AbortSignal.timeout(20000) });
-            if (r.ok) {
-              const url = URL.createObjectURL(await r.blob());
-              if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
-              img.src = url; dot.className = 'dot online';
-            } else dot.className = 'dot offline';
-          } catch { dot.className = 'dot offline'; }
-          t.classList.remove('wait');
-        }
-        if (!gone) setTimeout(next, 4000);
+      const shoot = async t => {
+        const img = t.querySelector('img'), { sn, ch } = parseId(t.dataset.hid), dot = t.querySelector('.dot');
+        if (!img) return; // became a video
+        t.classList.toggle('wait', !img.getAttribute('src'));
+        try {
+          await find();
+          const r = await fetch(api.snapURL(sn, ch, 3), { signal: AbortSignal.timeout(8000) });
+          if (!r.ok) throw 0;
+          const url = URL.createObjectURL(await r.blob());
+          if (!t.isConnected || !t.dataset.photo) return URL.revokeObjectURL(url);
+          if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+          img.src = url; dot.className = 'dot online'; t.rest = 0;
+        } catch { dot.className = 'dot offline'; t.rest = Date.now() + 120e3; }
+        t.classList.remove('wait');
       };
-      next();
+      const worker = async () => {
+        while (!gone) {
+          const now = Date.now(), ready = shots.filter(t => !t.busy && !(t.rest > now));
+          const t = ready.length && !document.hidden ? ready[i++ % ready.length] : null;
+          if (t) { t.busy = true; await shoot(t); t.busy = false; }
+          await new Promise(r => setTimeout(r, t ? 3000 : 1000));
+        }
+      };
+      worker(); worker();
     }
     // an NVR can turn out to be slow (or stop being so) while this page is open: lay the tiles out again
     const slowSig = () => R.devices.filter(d => d.slow).map(d => d.sn).join();
