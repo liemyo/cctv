@@ -457,9 +457,10 @@ export function installHik(x) {
     let page = Math.min(store.get('hikMultiPage', 0), pages - 1);
     const cams = list.slice(page * per, page * per + per);
     const cols = n === 1 ? 1 : Math.min(n, Math.ceil(Math.sqrt(cams.length))), rows = Math.ceil(cams.length / cols) || 1;
-    // A slow NVR carries one stream, and several at once all stop (Klontong measured: 1 runs, the others ~1 frame/s).
-    // So one tile of it plays video and the rest show a fresh cloud photo in turn; tapping a tile opens it live.
-    const liveOf = new Set(), photoOf = cam => { const k = cam.d.sn; if (!isSlowNvr(k) || cam.c.locked) return false; if (liveOf.has(k)) return true; liveOf.add(k); return false; };
+    // A slow NVR can't carry many streams, and past its limit they all stop instead of slowing down. Klontong measured
+    // (~950 kbit/s upload, 110–290 kbit/s per SD stream): 3 run smoothly, 4 stutter, 6 mostly stand still. So at most
+    // MAX_SLOW tiles of it play video and the rest show a fresh cloud photo in turn; tapping a tile opens it live.
+    const MAX_SLOW = 3, liveOf = {}, photoOf = cam => { const k = cam.d.sn; if (!isSlowNvr(k) || cam.c.locked) return false; liveOf[k] = (liveOf[k] || 0) + 1; return liveOf[k] > MAX_SLOW; };
     const tiles = cams.map(cam => ({ ...cam, photo: photoOf(cam) })), photos = tiles.filter(t => t.photo);
     $('#main').innerHTML = `
       ${topbar('Multi Layar · Hik', `
@@ -468,7 +469,7 @@ export function installHik(x) {
         <button class="btn icon ${cover ? 'on' : ''}" id="mc" title="Isi penuh (potong tepi)">${ic('full')}</button>
         <div class="seg">${[1, 2, 3, 4].map(k => `<button data-n="${k}" class="${k === n ? 'on' : ''}">${k === 1 ? '1' : `${k}×${k}`}</button>`).join('')}</div>`)}
       ${!R.base && !R.devices.length ? relayBox() : ''}
-      ${photos.length ? `<div class="muted small mhint">Internet di lokasi ${esc([...new Set(photos.map(t => t.d.name))].join(', '))} hanya cukup untuk 1 video: kamera lainnya tampil sebagai foto yang diperbarui bergantian. Ketuk kamera untuk video langsung.</div>` : ''}
+      ${photos.length ? `<div class="muted small mhint">Internet di lokasi ${esc([...new Set(photos.map(t => t.d.name))].join(', '))} hanya cukup untuk ${MAX_SLOW} video sekaligus: kamera lainnya tampil sebagai foto yang diperbarui bergantian. Ketuk kamera untuk video langsung.</div>` : ''}
       <div class="multi ${cover ? 'cover' : ''}" style="--mcols:repeat(${cols},minmax(0,1fr));--mrows:repeat(${rows},minmax(0,1fr));--pcols:repeat(${n === 1 ? 1 : 2},minmax(0,1fr))">${tiles.map(({ d, c, photo }) => `
         <div class="tile" data-hid="${esc(d.sn)}.${c.ch}" ${photo ? 'data-photo="1"' : ''}>${photo ? '<img class="tsnap" alt="">' : '<video playsinline muted autoplay></video>'}
           <span class="badge"><i class="dot"></i>${esc(c.name)}${photo ? ' · foto' : ''}</span></div>`).join('')}</div>
