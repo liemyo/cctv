@@ -1,7 +1,7 @@
 // Hik-Connect part of the site (own menu, separate from iCSee). Hik-Connect's cloud has no browser API (its
 // video servers only speak raw TCP), so everything goes through the always-on relay server (HIK_SERVERS, Cloudflare,
 // source hik-relay/). No MacBook is involved. The access key is derived from the Klip Gerak key.
-import { sha256Hex } from './core.js?v=12';
+import { sha256Hex } from './core.js?v=13';
 
 export function installHik(x) {
   const { $, esc, ic, topbar, store, toast, go, route, LivePlayer, within, fileStamp, saveBlob, openViewer, dayLabel, timeLabel, S, cloud, ensureCloudKey } = x;

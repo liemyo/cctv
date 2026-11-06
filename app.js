@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=12';
-import { installHik } from './hikweb.js?v=21';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=13';
+import { installHik } from './hikweb.js?v=22';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=7';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
@@ -268,7 +268,14 @@ async function prefsSync() {
 }
 
 async function cloudReady() {
-  if (await ensureCloudKey()) await prefsSync();
+  if (await ensureCloudKey()) { await prefsSync(); recToken(); }
+}
+/** The cloud recorder signs in with this account's token; a new sign-in here reaches it through the private Drive folder. */
+async function recToken() {
+  const cs = cloud(), t = S.session?.token;
+  if (!cs || !t || t === 'demo' || store.get('recTokenSent') === t.slice(-16)) return;
+  try { if (await cs.drive.connected()) { await cs.drive.putDoc('rec-token', { t }); store.raw('recTokenSent', t.slice(-16)); } }
+  catch (e) { console.warn('rec token', e); }
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden && S.session) prefsSync(); });
 
@@ -1311,7 +1318,7 @@ async function viewPesan() {
   load();
 }
 
-// ---------- motion clips (Supabase, uploaded by the Mac app's recorder) ----------
+// ---------- motion clips (Google Drive; recorded by pantau/rec-worker, and by this page while cameras are on screen) ----------
 
 // Picture for a clip card: the photos, else Drive's own thumbnail of the video.
 const thumbKey = r => r.alarm_photo || r.photo || (isGdPath(r.video) ? r.video : null);
@@ -1334,7 +1341,7 @@ async function viewKlip() {
       ${topbar('Klip Gerak')}
       <form class="glass" id="kf" style="padding:20px;display:grid;gap:12px;max-width:620px">
         <b>Hubungkan Klip Gerak</b>
-        <div class="muted small">Klip video tiap gerakan direkam oleh aplikasi Pantau di Mac dan disimpan di cloud.
+        <div class="muted small">Klip video tiap gerakan direkam otomatis oleh perekam cloud dan disimpan di Google Drive.
           Untuk melihatnya di sini, salin <b>kunci cloud</b> dari aplikasi Mac: <b>Saya › Cloud › tampilkan kunci</b> (64 huruf/angka),
           lalu tempel di bawah. Kunci bawaan akun ini terbuka otomatis setelah masuk.</div>
         <input class="input" name="k" placeholder="kunci cloud 64 karakter" autocomplete="off" spellcheck="false">
@@ -1358,7 +1365,19 @@ async function viewKlip() {
   const seen = saved?.k === key.slice(0, 16) ? saved : null;
   const byId = new Map((seen?.rows || []).map(r => [r.id, r]));
   let rows = [...byId.values()], used = 0, quota = 0, count = seen?.count ?? null, thumbs = { ...(seen?.thumbs || {}) }, drive = seen?.bytes != null ? { bytes: seen.bytes } : null;
-  let filter = store.get('klipCam', 'all'), next = {}, loaded = false, loadedOnce = {}, errMsg = '', fails = 0, retryT = null, pollT = null, lastPoll = Date.now(), freshIds = new Set();
+  let filter = store.get('klipCam', 'all'), next = {}, loaded = false, loadedOnce = {}, errMsg = '', fails = 0, retryT = null, pollT = null, lastPoll = Date.now(), freshIds = new Set(), recState = null, recAt = 0;
+  // the cloud recorder (pantau/rec-worker) leaves its state in Drive every 5 minutes
+  const recCheck = () => {
+    if (Date.now() - recAt < 120000) return;
+    recAt = Date.now();
+    cs.drive.status().then(st => st.connected ? cs.drive.getDoc('rec-status') : null).then(d => {
+      if (!alive()) return;
+      if (!d) { recState = null; return statusLine(); }
+      const old = Date.now() - Date.parse(d.at) > 900000;
+      recState = old ? { ok: false, why: 'tidak menjawab' } : /sesi iCSee/.test(d.lastError || '') ? { ok: false, why: 'perlu masuk lagi' } : { ok: true };
+      statusLine();
+    }).catch(() => {});
+  };
   const sortRows = () => { rows = [...byId.values()].sort((x, y) => (y.at > x.at) - (y.at < x.at)); };
   const keep = () => {
     const top = rows.slice(0, 120), th = {};
@@ -1368,8 +1387,10 @@ async function viewKlip() {
   const statusLine = () => {
     const el = $('#usage');
     if (!el) return;
-    const sum = `${count == null ? 'Menghitung kejadian…' : `${count} kejadian`}${drive ? ` · Drive ${fmtBytes(drive.bytes)} dari ${fmtBytes(GDRIVE.quota)}${used ? ` · Supabase ${fmtBytes(used)}` : ''}` : quota ? ` · ${fmtBytes(used)} dari ${fmtBytes(quota)}` : ''}`;
-    el.innerHTML = `<span class="klive ${errMsg ? 'off' : ''}"></span>${errMsg ? `<b style="color:var(--warn)">${esc(errMsg)}</b> · ` : ''}${sum}`;
+    const onDrive = cs.drive.state?.connected;
+    const sum = `${count == null ? 'Menghitung kejadian…' : `${count} kejadian`}${drive ? ` · Drive ${fmtBytes(drive.bytes)} dari ${fmtBytes(GDRIVE.quota)}${used ? ` · Supabase ${fmtBytes(used)}` : ''}` : quota && !onDrive ? ` · ${fmtBytes(used)} dari ${fmtBytes(quota)}` : ''}`;
+    const rec = !recState ? '' : recState.ok ? 'Perekam cloud aktif · ' : `<b style="color:var(--warn)">Perekam cloud ${esc(recState.why)}</b> · `;
+    el.innerHTML = `<span class="klive ${errMsg || recState?.ok === false ? 'off' : ''}"></span>${errMsg ? `<b style="color:var(--warn)">${esc(errMsg)}</b> · ` : ''}${rec}${sum}`;
   };
   const draw = () => {
     const out = $('#out');
@@ -1419,6 +1440,7 @@ async function viewKlip() {
       if (!u || !alive()) return;
       drive = u; count = cs.drive.total(); statusLine(); keep();
     }).catch(() => {});
+    recCheck();
   };
   const load = async (more = false) => {
     clearTimeout(retryT);
@@ -1449,6 +1471,7 @@ async function viewKlip() {
     if (!alive()) return;
     if (!document.hidden && loaded) {
       const asked = Date.now();
+      recCheck();
       try {
         const got = await cs.changes(lastPoll);
         if (!alive()) return;
@@ -1534,8 +1557,8 @@ function viewSaya() {
         <div class="muted small">AppKey <code class="k">${esc(keys.appKey.slice(0, 6))}…</code> ·
           ${keys.appKey === PUBLIC_KEYS.appKey ? 'kunci demo publik JFTech' : 'kunci sendiri'} — ubah saat masuk (Kunci platform).</div>
       </div>
-      <div class="muted small">Pantau web · terhubung langsung ke cloud iCSee (rs.xmeye.net · api.jftechws.com). Tidak ada server perantara.
-        Bicara/interkom & perekam latar belakang hanya ada di aplikasi Mac. Tekan <b>\\</b> untuk menyembunyikan / membuka menu samping.</div>
+      <div class="muted small">Pantau web · terhubung langsung ke cloud iCSee (rs.xmeye.net · api.jftechws.com). Klip Gerak direkam terus oleh perekam cloud, walau situs ditutup dan Mac mati.
+        Bicara/interkom hanya ada di aplikasi Mac. Tekan <b>\\</b> untuk menyembunyikan / membuka menu samping.</div>
     </div>`;
   document.querySelectorAll('[data-skin]').forEach(b => b.onclick = () => { store.set('skin', b.dataset.skin); applyTheme(); route(); });
   document.querySelectorAll('[data-g]').forEach(b => b.onclick = () => { store.set('glass', b.dataset.g); applyTheme(); route(); });
