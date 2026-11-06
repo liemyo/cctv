@@ -455,6 +455,7 @@ export const GDRIVE = {
   fn: 'https://bbptcxpzzvgpxqylkrmw.supabase.co/functions/v1/pantau-drive', // pantau/drive/supabase/functions/pantau-drive
   quota: 5 * 2 ** 30, // rolling limit for the videos in the Drive folder "Pantau Klip"
   reserve: 32 * 2 ** 20,
+  chunk: 64 * 2 ** 20, // a full folder frees this much at once, so not every new clip has to wait for deletes
 };
 
 export class CloudStore {
@@ -486,13 +487,23 @@ export class CloudStore {
 
   /** Klip events, newest first. With Google Drive connected they live there (DriveStore events; used = 0 Supabase
    *  bytes); else in Supabase: used = Supabase + B2 bytes, quota = B2 quota when B2 is on. */
-  async list({ before = null, limit = 120, sn = null } = {}) {
-    if (await this.drive.connected()) return this.drive.events(this, { before, limit, sn });
+  async list({ before = null, limit = 120, sn = null, cursor = null } = {}) {
+    const st = await this.drive.status();
+    if (st.error) throw new JFError(-8, 'Google Drive belum menjawab');
+    if (st.connected) return this.drive.events(this, { before, limit, sn, cursor });
     const args = { p_limit: limit };
     if (before) args.p_before = before;
     if (sn) args.p_sn = sn;
     const [j, u] = await Promise.all([this.rpc('pantau_list', args), CLOUD.b2 && !before ? this.b2('/usage') : null]);
     return { rows: j.rows || [], used: (j.used || 0) + (u?.used || 0), count: j.count || 0, quota: u?.quota || CLOUD.supaQuota };
+  }
+
+  /** Events added or changed since `since` (ms), newest first: what a page showing the list needs to stay live. */
+  async changes(since) {
+    const st = await this.drive.status();
+    if (st.error) throw new JFError(-8, 'Google Drive belum menjawab');
+    if (st.connected) return this.drive.changes(this, since);
+    return (await this.list({ limit: 30 })).rows;
   }
 
   async signedURLs(paths, expires = 3600) {
@@ -616,27 +627,55 @@ export class CloudStore {
 // ---------- Google Drive (Klip Gerak videos) ----------
 
 const drives = new Map();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const timeoutSignal = ms => AbortSignal.timeout?.(ms);
+/** Runs fn over items, at most n at a time; the first failure is thrown once all are done. */
+async function pool(items, n, fn) {
+  let i = 0, err = null;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (i < items.length) {
+      const it = items[i++];
+      try { await fn(it); } catch (e) { err ||= e; }
+    }
+  }));
+  if (err) throw err;
+}
 
 /** Videos in the "Pantau Klip" folder of the connected Google Drive. The Edge Function pantau-drive keeps the
  *  refresh token and hands out 1-hour access tokens for the cloud key, so no device needs a Google login. */
 export class DriveStore {
-  constructor(key) { this.key = key; this.tok = null; this.state = null; this.usage = null; }
+  constructor(key) {
+    this.key = key; this.tok = null; this.state = null; this.usage = null;
+    this.recent = new Map(); // marker id → event, from latest() / changes() / own writes
+    this.thumbs = new Map(); // file id → thumbnail link
+    this.gone = new Set();   // deleted while a folder walk is running
+    this.oldestShown = 0;
+  }
 
   async fn(route, body = {}) {
-    const r = await fetch(GDRIVE.fn + route, {
-      method: 'POST', headers: { 'x-pantau-key': this.key, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new JFError(r.status, j.error === 'belum' ? 'Google Drive belum disambungkan' : `Drive ${r.status}: ${j.error || 'gagal'}`);
-    return j;
+    // the function sleeps when unused: its first answer can be slow or fail, so a hiccup is retried here
+    for (let n = 0; ; n++) {
+      let r;
+      try {
+        r = await fetch(GDRIVE.fn + route, {
+          method: 'POST', headers: { 'x-pantau-key': this.key, 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: timeoutSignal(15000),
+        });
+      } catch (e) {
+        if (n < 2) { await sleep(600 * (n + 1)); continue; }
+        throw new JFError(-9, `Drive tidak terjangkau: ${e.message}`);
+      }
+      if (r.status >= 500 && n < 2) { await sleep(600 * (n + 1)); continue; }
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new JFError(r.status, j.error === 'belum' ? 'Google Drive belum disambungkan' : `Drive ${r.status}: ${j.error || 'gagal'}`);
+      return j;
+    }
   }
 
   /** {connected, email}; cached for 5 min (null = unknown / no answer). */
   async status(fresh = false) {
     if (!fresh && this.state && Date.now() - this.state.at < 300000) return this.state;
-    try { this.state = { ...(await this.fn('/status')), at: Date.now() }; }
-    catch { if (!this.state) return { connected: false, email: '', error: true }; }
-    return this.state;
+    this.stateP ||= this.fn('/status').then(j => (this.state = { ...j, at: Date.now() })).catch(() => this.state || { connected: false, email: '', error: true }).finally(() => { this.stateP = null; });
+    return this.stateP;
   }
   async connected() { return (await this.status()).connected; }
 
@@ -653,36 +692,58 @@ export class DriveStore {
     return this.tokP;
   }
 
+  /** One Drive request. Reads and deletes survive a hiccup: expired token, rate limit, 5xx, a hung or dropped connection. */
   async api(url, init = {}) {
-    const t = await this.token();
-    const r = await fetch(url, { ...init, headers: { Authorization: `Bearer ${t.token}`, ...(init.headers || {}) } });
-    if (r.status === 401) this.tok = null;
-    if (!r.ok && !(init.method === 'DELETE' && r.status === 404)) {
-      const j = await r.json().catch(() => null);
-      throw new JFError(r.status, `Drive ${r.status}: ${j?.error?.message || 'gagal'}`);
+    const safe = !init.method || init.method === 'GET' || init.method === 'DELETE';
+    for (let n = 0; ; n++) {
+      const t = await this.token();
+      let r;
+      try {
+        r = await fetch(url, { ...init, signal: timeoutSignal(safe ? 30000 : 300000), headers: { Authorization: `Bearer ${t.token}`, ...(init.headers || {}) } });
+      } catch (e) {
+        if (safe && n < 3) { await sleep(800 * 2 ** n); continue; }
+        throw new JFError(-9, `Drive tidak terjangkau: ${e.message}`);
+      }
+      if (r.status === 401) this.tok = null;
+      if (r.ok || (init.method === 'DELETE' && r.status === 404)) return r;
+      const j = await r.json().catch(() => null), why = j?.error?.errors?.[0]?.reason || '';
+      const again = r.status === 401 || r.status === 429 || r.status >= 500 || /rateLimit/i.test(why);
+      if (again && n < 3 && (safe || r.status === 401)) { await sleep(800 * 2 ** n); continue; }
+      throw Object.assign(new JFError(r.status, `Drive ${r.status}: ${j?.error?.message || 'gagal'}`), { reason: why });
     }
-    return r;
   }
 
   /** Bytes used by the folder + size and thumbnail link of each file (cached 10 min; uploads / deletes keep it current).
-   *  Thumbnail links (lh3.googleusercontent.com, valid for hours) open without a token, so they work as <img src>. */
+   *  Thumbnail links (lh3.googleusercontent.com, valid for hours) open without a token, so they work as <img src>.
+   *  This walks the WHOLE folder (tens of seconds with 25,000 files): only rolling and the totals wait for it, the list
+   *  of clips comes from latest(). Calls during a walk share it. */
   async used(fresh = false) {
     if (!fresh && this.usage && Date.now() - this.usage.at < 600000) return this.usage;
-    const { folder } = await this.token(), sizes = new Map(), thumbs = new Map(), events = new Map();
+    return this.usedP ||= this.walk().finally(() => { this.usedP = null; });
+  }
+
+  async walk() {
+    const { folder } = await this.token(), sizes = new Map(), thumbs = new Map(), events = new Map(), others = new Map();
     let page = '';
+    const started = Date.now();
     do {
-      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false`, fields: 'nextPageToken,files(id,size,thumbnailLink,appProperties)', pageSize: '1000', ...(page ? { pageToken: page } : {}) });
+      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false`, fields: 'nextPageToken,files(id,name,size,createdTime,thumbnailLink,appProperties)', pageSize: '1000', ...(page ? { pageToken: page } : {}) });
       const j = await (await this.api(`https://www.googleapis.com/drive/v3/files?${q}`)).json();
       for (const f of j.files || []) {
         sizes.set(f.id, +f.size || 0);
-        if (f.thumbnailLink) thumbs.set(f.id, f.thumbnailLink);
+        if (f.thumbnailLink) { thumbs.set(f.id, f.thumbnailLink); this.thumbs.set(f.id, f.thumbnailLink); }
         if (f.appProperties?.k === 'ev') events.set(f.id, f.appProperties);
+        else others.set(f.id, { name: f.name || '', at: Date.parse(f.createdTime) || 0 });
       }
       page = j.nextPageToken || '';
     } while (page);
+    // what changed while walking stays known: uploads of this device were counted by upload(), deletes must not come back
+    for (const id of this.gone) { sizes.delete(id); events.delete(id); others.delete(id); }
+    for (const [id, a] of this.recent) if (!events.has(id) && a._seen >= started) events.set(id, a);
+    this.gone.clear();
     let bytes = 0;
     for (const v of sizes.values()) bytes += v;
-    return (this.usage = { bytes, sizes, thumbs, events, at: Date.now() });
+    return (this.usage = { bytes, sizes, thumbs, events, others, at: Date.now() });
   }
 
   /** Uploads one file into the folder → Drive file id. */
@@ -696,8 +757,15 @@ export class DriveStore {
       method: 'POST', body, headers: { 'Content-Type': `multipart/related; boundary=${b}` },
     });
     const f = await r.json();
-    if (this.usage) { this.usage.sizes.set(f.id, +f.size || blob.size); this.usage.bytes += +f.size || blob.size; }
+    this.count(f.id, +f.size || blob.size);
     return f.id;
+  }
+
+  count(id, size) {
+    if (!this.usage) return;
+    if (!this.usage.sizes.has(id)) this.usage.bytes += size;
+    this.usage.sizes.set(id, size);
+    this.usage.others.set(id, { name: '', at: Date.now() });
   }
 
   async blob(id) { return (await this.api(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`)).blob(); }
@@ -712,12 +780,31 @@ export class DriveStore {
   /** Picture URLs for row paths (<owner>/gd/<id>): Drive's thumbnail (size px), else — for photos, not for videos
    *  (`videos`) — the file itself (Drive makes thumbnails a little after the upload). */
   async thumbURLs(paths, { size = 400, videos = new Set() } = {}) {
-    const out = {}, u = await this.used(); // events() just refreshed the listing
-    await Promise.all(paths.map(async p => {
-      const id = p.split('/')[2], t = u.thumbs.get(id);
+    const out = {};
+    await this.fillThumbs(paths.map(p => p.split('/')[2]));
+    await pool(paths, 6, async p => {
+      const id = p.split('/')[2], t = this.thumbs.get(id);
       out[p] = t ? t.replace(/=s\d+$/, '') + `=s${size}` : videos.has(p) ? null : await this.objectURL(id).catch(() => null);
-    }));
+    });
     return out;
+  }
+
+  /** Thumbnail links without the folder walk: one query over the period of the newest files, single requests for the rest. */
+  async fillThumbs(ids) {
+    let need = ids.filter(id => !this.thumbs.has(id));
+    if (!need.length) return;
+    const fresh = this.oldestShown;
+    if (need.length > 6 && fresh) {
+      const { folder } = await this.token();
+      const q = new URLSearchParams({ q: `'${folder}' in parents and trashed = false and createdTime > '${new Date(fresh - 1200000).toISOString()}'`, fields: 'files(id,thumbnailLink)', orderBy: 'createdTime desc', pageSize: '1000' });
+      const j = await (await this.api(`https://www.googleapis.com/drive/v3/files?${q}`)).json().catch(() => null);
+      for (const f of j?.files || []) if (f.thumbnailLink) this.thumbs.set(f.id, f.thumbnailLink);
+      need = need.filter(id => !this.thumbs.has(id));
+    }
+    await pool(need.slice(0, 60), 6, async id => {
+      const f = await (await this.api(`https://www.googleapis.com/drive/v3/files/${id}?fields=thumbnailLink`)).json().catch(() => null);
+      if (f?.thumbnailLink) this.thumbs.set(id, f.thumbnailLink);
+    }).catch(() => {});
   }
 
   // Small JSON documents (web settings, the Hik-Connect relay address) as "pantau-<name>.json" in the folder,
@@ -747,27 +834,37 @@ export class DriveStore {
   }
 
   async remove(ids) {
-    for (const id of ids) {
+    await pool(ids, 6, async id => {
       await this.api(`https://www.googleapis.com/drive/v3/files/${id}`, { method: 'DELETE' });
+      if (this.usedP) this.gone.add(id);
+      this.thumbs.delete(id);
       if (this.usage?.sizes.has(id)) { this.usage.bytes -= this.usage.sizes.get(id); this.usage.sizes.delete(id); }
-    }
+      this.usage?.others.delete(id);
+    });
   }
 
-  /** Rolling storage: deletes the OLDEST Klip events that have Drive files until `incoming` more bytes fit in
-   *  GDRIVE.quota. Returns how many events were removed. */
-  async makeRoom(cs, incoming) {
+  /** Rolling storage: when the folder is over GDRIVE.quota the OLDEST Klip events go (GDRIVE.chunk below the limit, so
+   *  the next clips find room), plus files no event points to. One run at a time. Returns how many events were removed. */
+  async makeRoom(cs, incoming = 0) {
+    return this.rollP ||= this.roll(cs, incoming).finally(() => { this.rollP = null; });
+  }
+
+  async roll(cs, incoming) {
     const u = await this.used();
     const room = GDRIVE.quota - GDRIVE.reserve;
     if (u.bytes + incoming <= room) return 0;
-    const rows = this.rows(await cs.owner()).reverse(); // oldest first
+    const target = room - GDRIVE.chunk, rows = this.rows(await cs.owner()).reverse(); // oldest first
+    const owned = new Set();
+    for (const a of u.events.values()) for (const v of [a.v, a.p, a.ap]) if (v) owned.add(v);
+    const stray = [...u.others].filter(([id, o]) => !owned.has(id) && !o.name.startsWith('pantau-') && o.name && Date.now() - o.at > 7200e3).map(([id]) => id);
     let left = u.bytes;
+    for (const id of stray) left -= u.sizes.get(id) || 0;
+    if (stray.length) await this.remove(stray).catch(e => console.warn('drive stray', e));
     const ids = [];
     for (const r of rows) {
-      if (left + incoming <= room) break;
-      const files = [r.video, r.photo, r.alarm_photo].filter(isGdPath);
-      if (!files.length) continue;
+      if (left + incoming <= target) break;
       ids.push(r.id);
-      for (const p of files) left -= u.sizes.get(p.split('/')[2]) || 0;
+      for (const p of [r.video, r.photo, r.alarm_photo].filter(isGdPath)) left -= u.sizes.get(p.split('/')[2]) || 0;
     }
     if (ids.length) await this.removeEvents(cs, ids);
     return ids.length;
@@ -781,22 +878,65 @@ export class DriveStore {
 
   static PROPS = { video: 'v', photo: 'p', alarm_photo: 'ap' };
 
-  /** All events as rows, newest first (from the cached folder listing). */
-  rows(owner) {
+  toRow(owner, id, a) {
     const toPath = v => !v ? null : v.startsWith('/') ? owner + v : `${owner}/gd/${v}`;
-    return [...(this.usage?.events || new Map())].map(([id, a]) => ({
+    return {
       id, sn: a.sn || '', cam: a.c || '', event: a.e || '', alarm_id: a.a || '', at: a.t, secs: a.s ? +a.s : null, bytes: 0,
       video: toPath(a.v), photo: toPath(a.p), alarm_photo: toPath(a.ap),
-    })).sort((x, y) => (y.at > x.at) - (y.at < x.at));
+    };
   }
 
-  /** Page of events like the Supabase list: newest first, older than `before`, optionally one camera. */
-  async events(cs, { before = null, limit = 120, sn = null } = {}) {
-    await this.used(!before);
-    const all = this.rows(await cs.owner());
-    const b = before && new Date(before).toISOString();
-    const rows = all.filter(r => (!sn || r.sn === sn) && (!b || r.at < b)).slice(0, limit);
-    return { rows, used: 0, count: all.length, quota: GDRIVE.quota };
+  /** All known events as rows, newest first (the folder walk + what latest() / changes() brought since). */
+  rows(owner) {
+    const all = new Map([...(this.usage?.events || []), ...this.recent]);
+    return [...all].map(([id, a]) => this.toRow(owner, id, a)).sort((x, y) => (y.at > x.at) - (y.at < x.at));
+  }
+
+  /** How many events the folder holds; null until the first walk has finished. */
+  total() {
+    if (!this.usage) return null;
+    let n = this.usage.events.size;
+    for (const id of this.recent.keys()) if (!this.usage.events.has(id)) n++;
+    return n;
+  }
+
+  async query(q, { limit = 120, orderBy = 'createdTime desc', pageToken = '' } = {}) {
+    const { folder } = await this.token();
+    const p = new URLSearchParams({
+      q: `'${folder}' in parents and trashed = false and appProperties has { key='k' and value='ev' }${q}`,
+      fields: 'nextPageToken,files(id,createdTime,appProperties)', orderBy, pageSize: String(limit), ...(pageToken ? { pageToken } : {}),
+    });
+    const j = await (await this.api(`https://www.googleapis.com/drive/v3/files?${p}`)).json();
+    const now = Date.now();
+    for (const f of j.files || []) {
+      this.recent.set(f.id, Object.assign(f.appProperties, { _seen: now }));
+      const c = Date.parse(f.createdTime);
+      if (c && (!this.oldestShown || c < this.oldestShown)) this.oldestShown = c;
+    }
+    return j;
+  }
+
+  /** One page of events, newest first, in one request: the marker files can be asked for directly. The list never waits
+   *  for the folder walk; that runs behind it for the totals. `cursor` = `next` of the page before. */
+  async events(cs, { before = null, limit = 120, sn = null, cursor = null } = {}) {
+    const owner = await cs.owner();
+    if (before && !cursor) {
+      await this.used();
+      const b = new Date(before).toISOString();
+      const rows = this.rows(owner).filter(r => (!sn || r.sn === sn) && r.at < b).slice(0, limit);
+      return { rows, used: 0, count: this.total() ?? 0, quota: GDRIVE.quota, next: null };
+    }
+    const j = await this.query(sn ? ` and appProperties has { key='sn' and value='${sn.replace(/'/g, "\\'")}' }` : '', { limit, pageToken: cursor || '' });
+    this.used().catch(e => console.warn('drive', e));
+    const rows = (j.files || []).map(f => this.toRow(owner, f.id, f.appProperties)).sort((x, y) => (y.at > x.at) - (y.at < x.at));
+    return { rows, used: 0, count: this.total(), quota: GDRIVE.quota, next: j.nextPageToken || null };
+  }
+
+  /** Events added or changed (video arrived after the photo) since `since` ms; Drive's listing can trail, hence the margin. */
+  async changes(cs, since) {
+    const owner = await cs.owner();
+    const j = await this.query(` and modifiedTime > '${new Date(since - 120000).toISOString()}'`, { limit: 100, orderBy: 'modifiedTime desc' });
+    return (j.files || []).map(f => this.toRow(owner, f.id, f.appProperties));
   }
 
   async putEvent(cs, ev) {
@@ -832,31 +972,41 @@ export class DriveStore {
       id = await this.upload(name, new Blob(['{}'], { type: 'application/json' }), 'application/json', { appProperties: props });
     }
     this.evIds.set(key, id);
-    if (this.usage) this.usage.events.set(id, { ...(this.usage.events.get(id) || {}), ...props });
+    this.recent.set(id, { ...(this.recent.get(id) || this.usage?.events.get(id) || {}), ...props, _seen: Date.now() });
     return id;
   }
 
   /** Deletes events (marker ids) with their files; returns how many files went. */
   async removeEvents(cs, ids) {
-    const u = await this.used(), owner = await cs.owner(), sb = [];
+    const owner = await cs.owner(), sb = [];
     let n = 0;
-    for (const id of ids) {
-      let a = u.events.get(id);
+    await pool(ids, 4, async id => {
+      let a = this.recent.get(id) || this.usage?.events.get(id);
       if (!a) a = (await (await this.api(`https://www.googleapis.com/drive/v3/files/${id}?fields=appProperties`)).json()).appProperties || {};
       const files = [a.v, a.p, a.ap].filter(Boolean);
       sb.push(...files.filter(v => v.startsWith('/')).map(v => owner + v));
       await this.remove([...files.filter(v => !v.startsWith('/')), id]);
-      u.events.delete(id);
+      this.usage?.events.delete(id);
+      this.recent.delete(id);
       for (const [k, v] of this.evIds || []) if (v === id) this.evIds.delete(k);
       n += files.length;
-    }
+    });
     if (sb.length) await cs.removePaths(sb);
     return n;
   }
 
-  /** Stores a clip video or photo: room first, then the upload → row path <owner>/gd/<id>. */
+  /** Stores a clip video or photo → row path <owner>/gd/<id>. The upload goes first, so a new clip never waits for old
+   *  ones to be deleted; the rolling limit catches up right behind it (the Google account has room for the overlap). */
   async put(cs, name, blob, mime) {
-    await this.makeRoom(cs, blob.size);
-    return `${await cs.owner()}/gd/${await this.upload(name, blob, mime)}`;
+    const owner = await cs.owner();
+    let id;
+    try { id = await this.upload(name, blob, mime); }
+    catch (e) {
+      if (!/storageQuotaExceeded|quotaExceeded/.test(e.reason || '')) throw e;
+      await this.makeRoom(cs, blob.size);
+      id = await this.upload(name, blob, mime);
+    }
+    this.makeRoom(cs).catch(e => console.warn('drive roll', e));
+    return `${owner}/gd/${id}`;
   }
 }

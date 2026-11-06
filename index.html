@@ -241,6 +241,10 @@ details summary { cursor: pointer; color: var(--ink2); font-size: 13px; }
 .ev .meta span { font-size: 11.5px; color: var(--ink2); }
 .ev .play { position: absolute; right: 8px; bottom: 8px; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: rgba(0,0,0,.5); color: #fff; }
 .empty { padding: 36px 20px; text-align: center; color: var(--ink2); }
+.klive { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #3ddc84; margin-right: 6px; vertical-align: 1px; animation: klive 2s ease-in-out infinite; }
+.klive.off { background: var(--warn); animation: none; }
+@keyframes klive { 50% { opacity: .35; } }
+.ev.new { box-shadow: 0 0 0 1.5px var(--accent, #39c6f0) inset; }
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; min-width: 0; }
 .toolbar .chips { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; min-width: 0; }
 .toolbar .chips::-webkit-scrollbar { display: none; }
@@ -465,6 +469,6 @@ body[data-view="multi"]::before, body[data-view="multi"]::after { animation-play
 </head>
 <body>
 <div id="root"></div>
-<script type="module" src="app.js?v=41"></script>
+<script type="module" src="app.js?v=42"></script>
 </body>
 </html>

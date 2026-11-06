@@ -1,6 +1,6 @@
 // Pantau web — UI. Core API in core.js (port of the Mac app's PantauCore).
-import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=11';
-import { installHik } from './hikweb.js?v=20';
+import { JFClient, PUBLIC_KEYS, CloudStore, eventLabel, SENS, isGdPath, GDRIVE } from './core.js?v=12';
+import { installHik } from './hikweb.js?v=21';
 import { Watcher, PreRoll, LEVELS, snapshot, personBoxes } from './watch.js?v=7';
 import { PersonEye, PLEVELS } from './person.js?v=2';
 
@@ -320,6 +320,7 @@ async function logout(silent) {
   if (!silent) await api.logout();
   S.session = null; S.devices = []; S.thumbs = {};
   store.set('session', null); store.set('devices', null); store.set('thumbs', null);
+  store.raw('klipCache', null);
   api = new JFClient(store.get('keys') || PUBLIC_KEYS);
   location.hash = '';
   route();
@@ -1214,7 +1215,7 @@ function openViewer(items, index) {
       <div class="media"><div class="spin" style="width:36px;height:36px;border-radius:50%;border:3px solid #fff3;border-top-color:#fff;animation:spin 1s linear infinite"></div></div>
       <div class="cap">${esc(it.caption || '')}</div>`;
     el.querySelectorAll('[data-a]').forEach(b => b.onclick = () => act(b.dataset.a));
-    const src = await it.resolve();
+    const src = await Promise.resolve().then(() => it.resolve()).catch(() => null);
     if (items[i] !== it) return;
     it.src = src;
     const m = el.querySelector('.media');
@@ -1314,6 +1315,10 @@ async function viewPesan() {
 
 // Picture for a clip card: the photos, else Drive's own thumbnail of the video.
 const thumbKey = r => r.alarm_photo || r.photo || (isGdPath(r.video) ? r.video : null);
+let klipGen = 0, klipPoke = null;
+// back on the tab or back online: new clips straight away instead of at the next tick
+document.addEventListener('visibilitychange', () => { if (!document.hidden) klipPoke?.(); });
+addEventListener('online', () => klipPoke?.());
 
 async function viewKlip() {
   const main = $('#main');
@@ -1347,23 +1352,45 @@ async function viewKlip() {
     $('#kauto') && ($('#kauto').onclick = () => { store.raw('cloudOff', null); route(); });
     return;
   }
-  const cs = new CloudStore(key);
-  let rows = [], used = 0, quota = 0, count = 0, thumbs = {}, drive = null, filter = store.get('klipCam', 'all');
+  const cs = new CloudStore(key), gen = ++klipGen, alive = () => gen === klipGen && S.view === 'klip' && !!$('#out');
+  // shown at once from the last visit, then brought up to date; every 10 s after that only what changed is asked for
+  const saved = store.get('klipCache', null);
+  const seen = saved?.k === key.slice(0, 16) ? saved : null;
+  const byId = new Map((seen?.rows || []).map(r => [r.id, r]));
+  let rows = [...byId.values()], used = 0, quota = 0, count = seen?.count ?? null, thumbs = { ...(seen?.thumbs || {}) }, drive = seen?.bytes != null ? { bytes: seen.bytes } : null;
+  let filter = store.get('klipCam', 'all'), next = {}, loaded = false, loadedOnce = {}, errMsg = '', fails = 0, retryT = null, pollT = null, lastPoll = Date.now(), freshIds = new Set();
+  const sortRows = () => { rows = [...byId.values()].sort((x, y) => (y.at > x.at) - (y.at < x.at)); };
+  const keep = () => {
+    const top = rows.slice(0, 120), th = {};
+    for (const r of top) { const p = thumbKey(r); if (p && /^https:/.test(thumbs[p] || '')) th[p] = thumbs[p]; }
+    store.raw('klipCache', { k: key.slice(0, 16), rows: top, thumbs: th, count, bytes: drive?.bytes ?? null });
+  };
+  const statusLine = () => {
+    const el = $('#usage');
+    if (!el) return;
+    const sum = `${count == null ? 'Menghitung kejadian…' : `${count} kejadian`}${drive ? ` · Drive ${fmtBytes(drive.bytes)} dari ${fmtBytes(GDRIVE.quota)}${used ? ` · Supabase ${fmtBytes(used)}` : ''}` : quota ? ` · ${fmtBytes(used)} dari ${fmtBytes(quota)}` : ''}`;
+    el.innerHTML = `<span class="klive ${errMsg ? 'off' : ''}"></span>${errMsg ? `<b style="color:var(--warn)">${esc(errMsg)}</b> · ` : ''}${sum}`;
+  };
   const draw = () => {
+    const out = $('#out');
+    if (!out) return;
     const list = rows.filter(r => filter === 'all' || r.sn === filter);
     let html = '', lastDay = '';
     list.forEach((r, k) => {
       const t = new Date(r.at), dl = dayLabel(t);
       if (dl !== lastDay) { html += `${lastDay ? '</div>' : ''}<div class="day">${dl}</div><div class="list">`; lastDay = dl; }
       const th = thumbs[thumbKey(r)];
-      html += `<button class="ev glass" data-k="${k}"><div class="thumb">${th ? `<img loading="lazy" src="${esc(th)}" alt="">` : ic('film')}
+      html += `<button class="ev glass ${freshIds.has(r.id) ? 'new' : ''}" data-k="${k}"><div class="thumb">${th ? `<img loading="lazy" src="${esc(th)}" alt="" onerror="this.remove()">` : ic('film')}
         ${r.video ? `<span class="play">${ic('play')}</span>` : ''}</div>
         <div class="meta"><b>${esc(eventLabel(r.event))}</b><span>${esc(r.cam || devBySn(r.sn)?.name || r.sn)} · ${timeLabel(t)}${r.secs ? ` · ${Math.round(r.secs)} dtk` : ''}</span></div></button>`;
     });
     if (lastDay) html += '</div>';
-    $('#out').innerHTML = list.length ? html + (rows.length < count ? '<div class="row" style="justify-content:center;margin-top:16px"><button class="btn" id="more">Muat lagi</button></div>' : '')
+    const more = (next[filter] || (!cs.drive.state?.connected && rows.length < (count || 0)))
+      ? '<div class="row" style="justify-content:center;margin-top:16px"><button class="btn" id="more">Muat lagi</button></div>' : '';
+    out.innerHTML = list.length ? html + more
+      : !loadedOnce[filter] ? `<div class="empty glass">${errMsg ? `${esc(errMsg)} — mencoba lagi…` : 'Memuat klip…'}</div>`
       : '<div class="empty glass">Belum ada klip.</div>';
-    $('#usage').textContent = `${count} kejadian · ${drive ? `Drive ${fmtBytes(drive.bytes)} dari ${fmtBytes(GDRIVE.quota)}${used ? ` · Supabase ${fmtBytes(used)}` : ''}` : `${fmtBytes(used)} dari ${fmtBytes(quota)}`}`;
+    statusLine();
     main.querySelectorAll('.ev').forEach(b => b.onclick = () => {
       const items = list.map(r => ({
         video: !!r.video, poster: thumbs[thumbKey(r)],
@@ -1378,39 +1405,87 @@ async function viewKlip() {
       }));
       openViewer(items, +b.dataset.k);
     });
-    $('#more') && ($('#more').onclick = () => load(rows[rows.length - 1]?.at));
+    $('#more') && ($('#more').onclick = e => { e.target.disabled = true; e.target.textContent = 'Memuat…'; load(true); });
   };
-  const load = async (before = null) => {
+  const fillThumbs = async list => {
+    const paths = [...new Set(list.map(thumbKey).filter(Boolean))].filter(p => !thumbs[p]);
+    if (!paths.length) return;
+    const gd = paths.filter(isGdPath), sb = paths.filter(p => !isGdPath(p));
+    if (gd.length) Object.assign(thumbs, await cs.drive.thumbURLs(gd, { videos: new Set(list.map(r => r.video)) }).catch(() => ({})));
+    for (let i = 0; i < sb.length; i += 100) Object.assign(thumbs, await cs.signedURLs(sb.slice(i, i + 100)).catch(() => ({})));
+  };
+  const totals = () => {
+    cs.drive.status().then(st => st.connected && cs.drive.used()).then(u => {
+      if (!u || !alive()) return;
+      drive = u; count = cs.drive.total(); statusLine(); keep();
+    }).catch(() => {});
+  };
+  const load = async (more = false) => {
+    clearTimeout(retryT);
+    const f = filter;
     try {
-      const page = await cs.list({ before, limit: 120 });
-      rows = before ? rows.concat(page.rows) : page.rows;
-      if (!before) {
-        used = page.used; quota = page.quota;
-        cs.drive.connected().then(on => on && cs.drive.used()).then(u => { drive = u || null; if (S.view === 'klip' && u) draw(); }).catch(() => {});
-      }
-      count = page.count;
-      const paths = [...new Set(page.rows.map(thumbKey).filter(Boolean))];
+      const page = await cs.list({ limit: 120, sn: f === 'all' ? null : f, cursor: more ? next[f] : null, before: more ? rows[rows.length - 1]?.at : null });
+      if (!alive()) return;
+      for (const r of page.rows) byId.set(r.id, r);
+      sortRows();
+      if (page.next !== undefined) next[f] = page.next;
+      used = page.used; quota = page.quota;
+      if (page.count != null) count = page.count;
+      loadedOnce[f] = true; loaded = true; errMsg = ''; fails = 0;
       draw();
-      const gd = paths.filter(isGdPath), sb = paths.filter(p => !isGdPath(p));
-      if (gd.length) Object.assign(thumbs, await cs.drive.thumbURLs(gd, { videos: new Set(page.rows.map(r => r.video)) }).catch(() => ({})));
-      for (let i = 0; i < sb.length; i += 100) Object.assign(thumbs, await cs.signedURLs(sb.slice(i, i + 100)));
-      if (S.view === 'klip') draw();
-    } catch (e) { $('#out').innerHTML = `<div class="empty glass">${esc(e.message)}</div>`; }
+      totals();
+      await fillThumbs(page.rows);
+      if (alive()) { draw(); keep(); }
+    } catch (e) {
+      if (!alive()) return;
+      // nothing to press: it keeps trying, and what is on screen stays there
+      errMsg = e.message || 'Gagal memuat klip';
+      draw();
+      retryT = setTimeout(() => alive() && load(more), Math.min(30000, 2000 * 2 ** fails++));
+    }
   };
+  const poll = async () => {
+    clearTimeout(pollT);
+    if (!alive()) return;
+    if (!document.hidden && loaded) {
+      const asked = Date.now();
+      try {
+        const got = await cs.changes(lastPoll);
+        if (!alive()) return;
+        lastPoll = asked;
+        const changed = got.filter(r => JSON.stringify(byId.get(r.id) ?? null) !== JSON.stringify(r));
+        const missing = rows.slice(0, 30).filter(r => thumbKey(r) && !thumbs[thumbKey(r)]);
+        if (errMsg) { errMsg = ''; statusLine(); }
+        if (changed.length || missing.length) {
+          for (const r of changed) { if (!byId.has(r.id)) freshIds.add(r.id); byId.set(r.id, r); }
+          sortRows();
+          if (cs.drive.state?.connected) { const n = cs.drive.total(); if (n != null) count = n; }
+          if (changed.length) draw();
+          await fillThumbs([...changed, ...missing]);
+          if (alive()) { draw(); keep(); }
+        }
+      } catch (e) { if (alive()) { errMsg = 'Tersambung ulang…'; statusLine(); } }
+    }
+    if (alive()) pollT = setTimeout(poll, 10000);
+  };
+  klipPoke = () => { if (alive() && loaded) poll(); else if (alive()) load(); };
   main.innerHTML = `
     ${topbar('Klip Gerak', `<button class="btn icon" id="rf" title="Segarkan">${ic('refresh')}</button>`)}
     <div class="toolbar">
       <div class="chips">${[['all', 'Semua'], ...S.devices.map(d => [d.sn, d.name])].map(([k, v]) => `<button class="chip ${filter === k ? 'on' : ''}" data-f="${esc(k)}">${esc(v)}</button>`).join('')}</div>
       <span class="spacer"></span><span class="muted small" id="usage"></span>
     </div>
-    <div id="out"><div class="empty glass">Memuat klip…</div></div>`;
+    <div id="out"></div>`;
   main.querySelectorAll('[data-f]').forEach(b => b.onclick = () => {
     filter = b.dataset.f; store.set('klipCam', filter);
     main.querySelectorAll('[data-f]').forEach(x => x.classList.toggle('on', x === b));
     draw();
+    if (!loadedOnce[filter]) load();
   });
-  $('#rf').onclick = () => load();
+  $('#rf').onclick = () => { loadedOnce = {}; next = {}; load(); };
+  draw();
   load();
+  pollT = setTimeout(poll, 10000);
 }
 
 // ---------- settings ----------
@@ -1467,7 +1542,7 @@ function viewSaya() {
   $('#lo').onclick = () => { if (confirm('Keluar dari akun ini di browser ini?')) logout(false); };
   document.querySelectorAll('[data-t]').forEach(b => b.onclick = () => { store.set('theme', b.dataset.t); applyTheme(); route(); });
   document.querySelectorAll('[data-m]').forEach(b => b.onclick = () => { store.set('mode', b.dataset.m); route(); });
-  $('#ck') && ($('#ck').onclick = () => { store.raw('cloudKey', null); store.raw('cloudOff', true); route(); });
+  $('#ck') && ($('#ck').onclick = () => { store.raw('cloudKey', null); store.raw('cloudOff', true); store.raw('klipCache', null); route(); });
   $('#gd') && driveCard($('#gd'));
   HIK.sayaBind();
 }
